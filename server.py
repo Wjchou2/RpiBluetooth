@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import base64
+import errno
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import ipaddress
@@ -10,6 +11,7 @@ from pathlib import Path
 import secrets
 import tempfile
 import threading
+import time
 from urllib.parse import parse_qs, urlsplit
 
 import media
@@ -17,6 +19,10 @@ from sender import ADDRESS, DEFAULTS, DESTINATIONS, Sender
 
 PAGE = Path(__file__).with_name("index.html")
 MAX_UPLOAD = media.UINT32_MAX
+AUTO_RETRY_MIN = 3
+AUTO_RETRY_MAX = 30
+ADAPTER_UNREACHABLE = {errno.ETIMEDOUT, errno.EHOSTDOWN, errno.EHOSTUNREACH,
+                       errno.ENETDOWN, errno.ENETUNREACH, errno.ENODEV}
 
 
 def address(value):
@@ -27,8 +33,13 @@ def address(value):
 
 
 class App:
-    def __init__(self, adapter):
-        self.sender = Sender()
+    def __init__(self, adapter, auto_connect=True):
+        self.auto_enabled = adapter is not None and auto_connect
+        self.auto_wake = threading.Event()
+        self.auto_stop = threading.Event()
+        self.auto_after = 0
+        self.auto_thread = None
+        self.sender = Sender(connection_closed=self.auto_wake.set)
         self.loop = asyncio.new_event_loop()
         self.settings_file = Path.home() / ".config" / "nano-sender" / "device.json"
         try:
@@ -41,6 +52,9 @@ class App:
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         if adapter is not None:
             self.call(self.start_radio(adapter))
+            if self.auto_enabled:
+                self.auto_thread = threading.Thread(target=self.auto_connect, daemon=True)
+                self.auto_thread.start()
 
     async def start_radio(self, adapter):
         from bluez import Radio
@@ -48,6 +62,76 @@ class App:
         self.radio = Radio(adapter)
         await self.radio.start()
         await self.advertising(False)
+
+    def close(self):
+        self.auto_stop.set()
+        self.auto_wake.set()
+        if self.auto_thread:
+            self.auto_thread.join()
+        self.sender.disconnect()
+        self.loop.call_soon_threadsafe(self.loop.stop)
+
+    async def paired_for_auto_connect(self, peer):
+        if self.radio.scan_stop or self.radio.pair_task or self.radio.tx.notifying:
+            return False
+        return any(device["address"] == peer and device["paired"] for device in await self.radio.devices())
+
+    def auto_connect(self):
+        destinations = list(DESTINATIONS)
+        delay = 0
+        retry = AUTO_RETRY_MIN
+        while not self.auto_stop.is_set():
+            self.auto_wake.wait(delay)
+            self.auto_wake.clear()
+            if self.auto_stop.is_set():
+                break
+            delay = None
+            peer = self.saved
+            with self.sender.lock:
+                if not peer or self.sender.session:
+                    continue
+                if self.sender.job:
+                    delay = 2
+                    continue
+
+            delay = max(0, self.auto_after - time.monotonic())
+            if delay:
+                continue
+            if not self.connection_lock.acquire(blocking=False):
+                delay = 1
+                continue
+            try:
+                # Manual pairing or disconnect may have finished while we acquired the lock.
+                delay = max(0, self.auto_after - time.monotonic())
+                if delay:
+                    continue
+                if peer != self.saved:
+                    continue
+                with self.sender.lock:
+                    if self.sender.session or self.sender.job:
+                        delay = 2 if self.sender.job else None
+                        continue
+                delay = retry
+                retry = min(AUTO_RETRY_MAX, retry * 2)
+                if not self.call(self.paired_for_auto_connect(peer), timeout=3):
+                    continue
+                for destination in destinations:
+                    if self.auto_stop.is_set():
+                        return
+                    try:
+                        if self.sender.connect(peer, destination, self.radio.address, automatic=True):
+                            delay, retry = None, AUTO_RETRY_MIN
+                            destinations = [destination] + [other for other in destinations if other != destination]
+                        break
+                    except OSError as error:
+                        if isinstance(error, TimeoutError) or error.errno in ADAPTER_UNREACHABLE:
+                            # Let the other app go first next time if this probe could not reach the Nano.
+                            destinations.reverse()
+                            break
+            except Exception as error:
+                self.sender.status = f"Automatic connection will retry. {error}"
+            finally:
+                self.connection_lock.release()
 
     def call(self, coroutine, timeout=70):
         future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
@@ -88,6 +172,8 @@ class App:
         finally:
             path.unlink(missing_ok=True)
         self.saved = peer
+        self.auto_after = 0
+        self.auto_wake.set()
 
     def options(self, values):
         destination = values.get("destination")
@@ -107,7 +193,8 @@ class App:
             self.sender.options[destination] = options
 
     def state(self):
-        return {**self.sender.snapshot(), **self.call(self.radio_state(), 5), "saved": self.saved}
+        return {**self.sender.snapshot(), **self.call(self.radio_state(), 5), "saved": self.saved,
+                "autoConnect": self.auto_enabled}
 
     def command(self, action, payload):
         destination = payload.get("destination")
@@ -125,7 +212,7 @@ class App:
             peer = address(payload.get("address", ""))
             if destination not in DESTINATIONS:
                 raise ValueError("Choose YT Music or YT Video.")
-            if not self.connection_lock.acquire(blocking=False):
+            if not self.connection_lock.acquire(timeout=12):
                 raise RuntimeError("A Bluetooth connection is already being set up.")
             try:
                 if action == "connect":
@@ -136,7 +223,9 @@ class App:
                 if action == "connect":
                     self.sender.connect(peer, destination, self.radio.address)
                 else:
-                    self.sender.status = "Paired. Open the matching app on the Nano and click Connect."
+                    self.sender.status = ("Paired. Open YT Music or YT Video on the Nano to connect."
+                                          if self.auto_enabled else
+                                          "Paired. Open the matching app on the Nano and click Connect.")
             except Exception as error:
                 self.sender.status = str(error)
                 raise
@@ -147,7 +236,10 @@ class App:
         elif action == "confirm":
             self.call(self.radio.confirm(payload.get("accept") is True))
         elif action == "disconnect":
-            self.sender.disconnect()
+            with self.connection_lock:
+                self.auto_after = time.monotonic() + AUTO_RETRY_MAX
+                self.sender.disconnect()
+                self.auto_wake.set()
         elif action == "cancel":
             with self.sender.lock:
                 if self.sender.job:
@@ -312,6 +404,8 @@ def main():
     parser.add_argument("--listen", default="127.0.0.1", help="IPv4 bind address")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--adapter", default="hci0")
+    parser.add_argument("--no-auto-connect", action="store_true",
+                        help="Require Connect in the browser for Classic Bluetooth")
     args = parser.parse_args()
     bind = ipaddress.IPv4Address(args.listen)
     if not args.adapter.startswith("hci") or not args.adapter[3:].isdigit():
@@ -323,7 +417,7 @@ def main():
             server.authorization = b"Basic " + base64.b64encode(f"nano:{password}".encode())
             print(f"Browser login is nano / {password}", flush=True)
         try:
-            server.app = App(args.adapter)
+            server.app = App(args.adapter, auto_connect=not args.no_auto_connect)
         except Exception as error:
             parser.exit(1, f"Bluetooth setup failed: {error}\n")
         print(f"Nano Bluetooth Link listening on {bind}:{args.port}", flush=True)
@@ -332,7 +426,7 @@ def main():
         except KeyboardInterrupt:
             pass
         finally:
-            server.app.sender.disconnect()
+            server.app.close()
 
 
 if __name__ == "__main__":

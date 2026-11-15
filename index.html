@@ -115,19 +115,10 @@ const get = id => document.getElementById(id);
 const hide = (id, value) => { get(id).hidden = value; };
 const set = (id, text) => { get(id).textContent = text; };
 const modes = {
-  youtubeAudio: {audio: 'low', playback: 'live', download: false, query: '', link: ''},
-  youtubeVideo: {audio: 'medium', playback: 'after', download: false, quality: 'medium', fps: 15,
-    convert: false, query: '', link: ''},
+  youtubeAudio: {query: '', link: ''},
+  youtubeVideo: {query: '', link: ''},
   ble: {audio: 'high', transport: 'read', autoplay: false}
 };
-for (const mode of ['youtubeAudio', 'youtubeVideo']) {
-  try {
-    const saved = JSON.parse(localStorage.getItem('nano-link-' + mode));
-    const playback = mode === 'youtubeAudio' ? ['after', 'live', 'test'] : ['after', 'live'];
-    if (playback.includes(saved?.playback)) modes[mode].playback = saved.playback;
-    if (typeof saved?.download === 'boolean') modes[mode].download = saved.download;
-  } catch {}
-}
 let tab = 'youtubeAudio', state = {}, pending = '', devicesJSON = '', initialized = false, polling = false;
 const isVideo = () => tab === 'youtubeVideo';
 const isBLE = () => tab === 'ble';
@@ -185,11 +176,11 @@ function render() {
   for (const id of ['quality-row', 'fps-row', 'convert-row']) hide(id, !video);
   for (const id of ['transport-row', 'autoplay-row']) hide(id, !ble);
   get('download').disabled = !live || busy;
-  get('convert').disabled = busy;
-  get('audio').disabled = busy;
-  get('quality').disabled = busy;
-  get('fps').disabled = busy;
-  get('playback').disabled = busy;
+  get('convert').disabled = !initialized || busy;
+  get('audio').disabled = !initialized || busy;
+  get('quality').disabled = !initialized || busy;
+  get('fps').disabled = !initialized || busy;
+  get('playback').disabled = !initialized || busy;
   get('autoplay').disabled = busy;
   get('transport').disabled = busy;
   const receiveTest = get('playback').querySelector('[value=test]');
@@ -211,7 +202,7 @@ function render() {
   hide('stop-pair', !state.pairing);
   get('scan').disabled = busy || Boolean(state.connected) || pairing;
   get('pair').disabled = busy || Boolean(state.connected) || pairing || !get('address').value.trim();
-  get('connect').disabled = busy || scanActive || !get('address').value.trim();
+  get('connect').disabled = !initialized || busy || scanActive || !get('address').value.trim();
   get('message').disabled = busy;
   get('message').maxLength = state.bleLimit || 20;
   get('send-message').disabled = busy || !ready || !get('message').value.trim();
@@ -223,6 +214,7 @@ function render() {
   const app = video ? 'YT Video' : 'YT Music';
   set('discovery-hint', state.radioError || (state.pi ? 'On the Nano use Find Mac, or enter ' + state.pi + ' under Mac Address.' : 'Starting Bluetooth…'));
   set('hint', state.waitingForVideo && connected ? 'Close playback on the Nano before sending another video.' :
+    state.autoConnect && state.saved ? 'Open ' + app + ' on the Nano and start listening. The Pi connects automatically.' :
     'Open ' + app + ' on the Nano and start listening. Choose the Nano under Device Setup.');
   set('ble-hint', state.radioError || (state.bleReady ?
     (audioReady ? 'Connected. Audio clips can be up to 30 seconds.' : 'Connected. Waiting for the Nano to start GATT reads.') :
@@ -275,10 +267,13 @@ async function poll() {
     state = next;
     if (!initialized) {
       if (!get('address').value) get('address').value = state.saved || '';
+      for (const mode of ['youtubeAudio', 'youtubeVideo']) {
+        Object.assign(modes[mode], state.settings[mode]);
+      }
+      loadOptions();
       initialized = true;
       // A reload returns to YT Music and resumes its Classic discovery beacon.
       await control('mode');
-      if (!isBLE()) await control('settings');
     }
     render();
   } catch (error) { showError(error.message); }
@@ -286,7 +281,7 @@ async function poll() {
 }
 get('tabs').addEventListener('click', async event => {
   const next = event.target.dataset.tab;
-  if (!next || next === tab || pending || state.busy || state.scanning || state.pairing) return;
+  if (!initialized || !next || next === tab || pending || state.busy || state.scanning || state.pairing) return;
   const changeAdvertising = isBLE() || next === 'ble';
   tab = next;
   loadOptions();
@@ -295,7 +290,6 @@ get('tabs').addEventListener('click', async event => {
   for (const button of get('tabs').querySelectorAll('button')) button.setAttribute('aria-selected', button.dataset.tab === tab);
   render();
   if (changeAdvertising) await act('mode');
-  if (!isBLE()) await control('settings');
 });
 get('devices').onchange = () => {
   if (get('devices').value) get('address').value = get('devices').value;
@@ -311,13 +305,7 @@ for (const id of ['audio', 'quality', 'fps', 'playback', 'convert', 'download', 
     const field = get(id);
     const mode = modes[tab];
     mode[id] = field.type === 'checkbox' ? field.checked : id === 'fps' ? Number(field.value) : field.value;
-    if (!isBLE()) {
-      if (id === 'playback' || id === 'download') {
-        try { localStorage.setItem('nano-link-' + tab, JSON.stringify({playback: mode.playback, download: mode.download})); }
-        catch {}
-      }
-      control('settings');
-    }
+    if (!isBLE() && initialized) control('settings');
     render();
   };
 }

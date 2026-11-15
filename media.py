@@ -34,6 +34,19 @@ YT_DLP = ["yt-dlp", "--ignore-config", "--no-progress", "--no-warnings",
           "--js-runtimes", "node", "--socket-timeout", "15", "--extractor-retries", "1"]
 
 
+class YouTubeFormatUnavailable(RuntimeError):
+    pass
+
+
+def youtube_download_error(log):
+    lines = log.strip().splitlines()
+    detail = next((line for line in reversed(lines) if line.startswith("ERROR:")), "")
+    detail = detail.removeprefix("ERROR: ") or (lines[-1] if lines else "YouTube download failed.")
+    if "Requested format is not available" in detail:
+        return YouTubeFormatUnavailable(detail)
+    return RuntimeError(detail)
+
+
 def words(*values):
     return struct.pack("<" + "I" * len(values), *values)
 
@@ -77,7 +90,10 @@ def process(args, check, timeout=180):
                 except subprocess.TimeoutExpired:
                     continue
             if child.returncode:
-                raise RuntimeError(stderr.decode(errors="replace").strip()[-400:] or f"{args[0]} failed.")
+                detail = stderr.decode(errors="replace")
+                if args[0] == YT_DLP[0]:
+                    raise youtube_download_error(detail)
+                raise RuntimeError(detail.strip()[-400:] or f"{args[0]} failed.")
             return stdout
         finally:
             stop_process(child)
@@ -128,9 +144,10 @@ def stop_process(child):
 
 @contextmanager
 def download_stream(url, folder, video, check):
-    formats = ("b[height<=480][protocol^=m3u8]/b[height<=480][ext=webm]/b[height<=480][ext=mp4]"
+    formats = ("b[height<=480][protocol^=m3u8]/b[height<=480][ext=webm]/b[height<=480][ext=mp4]/b"
                if video else "ba[ext=webm]/ba/b")
-    args = [*YT_DLP, "--no-playlist", "--hls-use-mpegts", "-f", formats, "-o", "-", "--", youtube_url(url)]
+    sort = ["-S", "res:480"] if video else []
+    args = [*YT_DLP, "--no-playlist", "--hls-use-mpegts", *sort, "-f", formats, "-o", "-", "--", youtube_url(url)]
     with (folder / "yt-dlp-stream.log").open("w+b") as log, subprocess.Popen(
             args, stdout=subprocess.PIPE, stderr=log, start_new_session=True) as child:
         def validate():
@@ -139,12 +156,17 @@ def download_stream(url, folder, video, check):
                 time.sleep(.05)
             if child.returncode:
                 log.seek(0)
-                raise RuntimeError(log.read().decode(errors="replace").strip()[-400:] or "YouTube download failed.")
+                raise youtube_download_error(log.read().decode(errors="replace"))
 
         try:
             yield child.stdout, validate
-        except Exception:
-            if child.poll() not in (None, 0):
+        except (RuntimeError, ValueError):
+            # FFmpeg can see EOF just before yt-dlp finishes reporting an error.
+            try:
+                result = child.wait(timeout=.25)
+            except subprocess.TimeoutExpired:
+                result = None
+            if result:
                 validate()
             raise
         finally:
@@ -331,14 +353,20 @@ def youtube_url(value):
 
 def download(url, folder, video, check):
     output = str(folder / "YouTube.%(ext)s")
-    args = (["-f", "bv[height<=480][vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[height<=480][vcodec^=avc1][ext=mp4]",
-             "--merge-output-format", "mp4"] if video else
-            ["-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "m4a", "--write-thumbnail"])
-    process([*YT_DLP, "--no-playlist", *args, "-o", output, "--", youtube_url(url)], check, timeout=900)
-    file = folder / ("YouTube.mp4" if video else "YouTube.m4a")
-    if not file.is_file():
-        raise RuntimeError("Could not prepare the YouTube media.")
-    return file
+    if video:
+        formats = ("bv[height<=480][vcodec^=avc1][ext=mp4]+ba[ext=m4a]/"
+                   "b[height<=480][vcodec^=avc1][ext=mp4]/bv*+ba/b/bv")
+        args = ["-f", formats, "-S", "res:480", "--merge-output-format", "mp4/mkv"]
+    else:
+        args = ["-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "m4a", "--write-thumbnail"]
+    raw = process([*YT_DLP, "--no-playlist", *args, "--print", "after_move:filepath",
+                   "-o", output, "--", youtube_url(url)], check, timeout=900)
+    paths = raw.decode(errors="replace").splitlines()
+    if paths:
+        file = Path(paths[-1]).resolve()
+        if file.parent == folder.resolve() and file.is_file():
+            return file
+    raise RuntimeError("Could not prepare the YouTube media.")
 
 
 def search(query, video, check):

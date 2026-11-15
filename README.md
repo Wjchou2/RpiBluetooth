@@ -21,14 +21,15 @@ Use `--adapter hci1` to choose a second adapter. If the adapter cannot power on,
 
 ## YT Music and YT Video
 
-1. Enable Bluetooth on the Nano, open **YT Music** or **YT Video**, and choose the matching browser tab.
-2. On the Nano, use **Find Mac** or enter the Pi's Bluetooth address under **Mac Address**, then start listening. The browser shows the Pi's Bluetooth address under **Device Setup**.
-3. On the browser, open **Device Setup** to find the Nano or enter its Classic Bluetooth address. If a scan misses it, keep the Nano's Bluetooth settings screen open during discovery, then return to the receiving app before connecting. Choose **Pair**, confirm that the codes match, and click **Connect**. The Pi remembers the address.
-4. Send a local file, paste a YouTube link, or search from either screen and pick a result on the Nano.
+1. Enable Bluetooth on the Nano and open **YT Music** or **YT Video**. Start listening with **Find Mac**, a saved sender, or **Mac Address**. The Pi's Bluetooth address appears under **Device Setup** on the webpage.
+2. For the first connection, open **Device Setup** on the webpage to find the Nano or enter its Classic Bluetooth address. Choose **Pair** and confirm the matching code. If discovery misses it, keep the Nano's Bluetooth settings open during discovery, then return to the receiving app.
+3. Leave the server running. On later uses, open either app on the Nano and start listening. The Pi connects to the saved, paired Nano and selects the correct app automatically. Search and choose a result on the Nano without opening the webpage.
 
-**After Transfer** saves the encoded media before playback. **While Sending** starts playback after buffering. YT Music also offers **Receive Test**. **Convert during transfer** lets YT Video send each H.264 group as it finishes encoding. With **While Sending** selected, **Download during transfer** overlaps downloading, converting, and sending a YouTube link or search result. Update YT Music on the Nano to use that option.
+The Pi waits between connection attempts and stops probing when connected. The retry delay starts at three seconds and backs off to 30 seconds after repeated failures. After a long idle period, give it time for the next retry. **Connect** still works on the webpage and **Disconnect** pauses automatic attempts for 30 seconds. Use `--no-auto-connect` to require a manual connection.
 
-YT Music offers 7.35, 11.025, 22.05, and 44.1 kHz mono, plus 44.1 kHz stereo. YT Video has five presets from **128 × 72** through **432 × 240**, 5, 10, 15, 22, and 30 FPS where supported by the receiver, and a separate audio quality setting. Close playback on the Nano before sending another video.
+Both apps default to **While Sending**, **Download during transfer**, and **44.1 kHz mono**. YT Video also defaults to **320 × 176**, **22 fps**, and **Convert during transfer**. Settings you change in the browser apply to searches from the Nano until you restart the server. Use current YT Music and YT Video builds for these options.
+
+You can also send a local file or a YouTube link from the webpage. **After Transfer** saves the encoded media before playback. YT Music also offers **Receive Test**. Close playback on the Nano before sending another video.
 
 ## BLE
 

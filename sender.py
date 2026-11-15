@@ -14,19 +14,19 @@ import media
 
 DESTINATIONS = {"youtubeAudio": 0x1009, "youtubeVideo": 0x100B}
 DEFAULTS = {
-    "youtubeAudio": {"audio": "low", "playback": "live", "download": False},
-    "youtubeVideo": {"audio": "medium", "playback": "after", "download": False,
-                     "quality": "medium", "fps": 15, "convert": False},
+    "youtubeAudio": {"audio": "fullMono", "playback": "live", "download": True},
+    "youtubeVideo": {"audio": "fullMono", "playback": "live", "download": True,
+                     "quality": "large", "fps": 22, "convert": True},
 }
 ADDRESS = re.compile(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")
 
 
-def connect_socket(address, psm, local_address):
+def connect_socket(address, psm, local_address, timeout=12):
     if not hasattr(socket, "BTPROTO_L2CAP"):
         raise RuntimeError("Classic L2CAP requires Linux with Bluetooth support.")
     channel = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET, socket.BTPROTO_L2CAP)
     try:
-        channel.settimeout(12)
+        channel.settimeout(timeout)
         if local_address:
             channel.bind((local_address, 0))
         # Linux BT_SECURITY, medium: authenticate with the paired Nano.
@@ -57,6 +57,7 @@ class Session:
         self.video_progress = False
         self.error = None
         self.audio_epoch = None
+        self.audio_verified = False
         self.results = {}
 
     def start(self):
@@ -100,9 +101,17 @@ class Session:
         if data == b"NYH1":
             self.artwork = True
         if self.destination == "youtubeAudio":
-            if data in (b"NYL3", b"NYL4", b"NYL5", b"NYL6"):
+            if data in (b"NYL3", b"NYL4", b"NYL5", b"NYL6", b"NYL7"):
                 self.audio_revision = max(self.audio_revision, data[3] - ord("0"))
                 self.artwork = True
+            elif len(data) >= 9 and data.startswith(b"NAR1"):
+                token, = struct.unpack_from("<I", data, 4)
+                if self.token and token == self.token:
+                    if data[8] == 0:
+                        self.audio_verified = True
+                    elif data[8] == 1:
+                        detail = data[9:].decode("utf-8", "replace")
+                        self.error = f"Nano: {detail}" if detail else "The Nano rejected the audio stream."
             elif len(data) == 8 and data[:4] in (b"NYZ2", b"NYZ3"):
                 token, = struct.unpack_from("<I", data, 4)
                 if self.token and token == self.token:
@@ -130,8 +139,8 @@ class Session:
             self.artwork = True
         return request
 
-    def wait_for(self, supported, check, message):
-        deadline = time.monotonic() + 2.5
+    def wait_for(self, supported, check, message, timeout=2.5):
+        deadline = time.monotonic() + timeout
         with self.condition:
             while not supported():
                 check()
@@ -146,6 +155,7 @@ class Session:
             self.token = token
             self.paused = False
             self.audio_epoch = None
+            self.audio_verified = False
             self.awaiting_video = self.destination == "youtubeVideo"
 
     def write(self, data, check, video_offset=None, audio_rate=0, prefix=b""):
@@ -189,13 +199,14 @@ class Session:
 
 
 class Sender:
-    def __init__(self):
+    def __init__(self, connection_closed=None):
         self.lock = threading.RLock()
         self.session = None
         self.job = None
         self.status = "Connect to the Nano."
         self.progress = None
         self.options = {mode: options.copy() for mode, options in DEFAULTS.items()}
+        self.connection_closed = connection_closed
 
     def snapshot(self):
         with self.lock:
@@ -207,16 +218,25 @@ class Sender:
                     "status": status, "progress": self.progress,
                     "waitingForVideo": bool(session and session.awaiting_video),
                     "audioRevision": session.audio_revision if session else 0,
-                    "videoRevision": session.video_revision if session else 0}
+                    "videoRevision": session.video_revision if session else 0,
+                    "settings": {mode: options.copy() for mode, options in self.options.items()}}
 
-    def connect(self, address, destination, local_address):
-        self.disconnect()
-        channel, mtu = connect_socket(address, DESTINATIONS[destination], local_address)
+    def connect(self, address, destination, local_address, *, automatic=False):
+        if not automatic:
+            self.disconnect()
+        timeout = 4 if automatic else 12
+        channel, mtu = connect_socket(address, DESTINATIONS[destination], local_address, timeout)
         session = Session(channel, mtu, destination, self.request, self.closed)
         with self.lock:
+            if automatic and (self.session or self.job):
+                session.close()
+                return False
             self.session = session
-            self.status = f"Connected to {address}."
+            app = "YT Music" if destination == "youtubeAudio" else "YT Video"
+            self.status = f"Connected to {app} on {address}."
+            self.progress = None
         session.start()
+        return True
 
     def disconnect(self):
         with self.lock:
@@ -237,6 +257,8 @@ class Sender:
                     self.status = session.error
                 elif self.status.startswith(("Connected", "Sending", "Playing", "Preparing", "Searching")):
                     self.status = "The Nano closed the connection."
+        if self.connection_closed:
+            self.connection_closed()
 
     def require(self, destination):
         with self.lock:
@@ -418,6 +440,8 @@ class Sender:
     def send_progressive_audio(self, session, url, folder, opts, check):
         session.wait_for(lambda: session.audio_revision >= 6, check,
                          "Update YT Music on the Nano to use Download during transfer.")
+        framed = session.audio_revision >= 7
+        tag = b"NYU2" if framed else b"NYU1"
         rate, channels = media.AUDIO[opts["audio"]]
         token = secrets.randbelow(media.UINT32_MAX) + 1
         speed = audio_speed(rate, channels, True)
@@ -440,15 +464,24 @@ class Sender:
                         if not started:
                             started = True
                             session.begin_flow(token)
-                            session.write(media.record(b"NYU1", media.words(rate, channels, token)), check)
+                            session.write(media.record(tag, media.words(rate, channels, token)), check)
                             self.status = "Downloading, converting, and sending audio…"
                         if sent + len(chunk) > media.UINT32_MAX:
                             raise ValueError("The audio exceeds the Nano's 4 GiB transfer range.")
-                        session.write(chunk, check, audio_rate=speed, prefix=b"\0")
+                        if framed:
+                            session.write(media.words(len(chunk)) + chunk, check, audio_rate=speed)
+                        else:
+                            session.write(chunk, check, audio_rate=speed, prefix=b"\0")
                         checksum = media.checksum(chunk, checksum)
                         sent += len(chunk)
                 validate()
-                session.write(b"\1" + media.words(sent, checksum), check)
+                if framed:
+                    session.write(media.words(0, sent, checksum), check)
+                    self.status = "Waiting for the Nano to verify the audio…"
+                    session.wait_for(lambda: session.audio_verified, check,
+                                     "The Nano did not confirm the audio transfer.", timeout=6)
+                else:
+                    session.write(b"\1" + media.words(sent, checksum), check)
         except Exception:
             if started:
                 session.close()
@@ -543,9 +576,12 @@ class Sender:
                 self.progress = 0
                 with closing(read_spool(spool)) as packets:
                     send(packets, size, size)
-        except Exception:
+        except Exception as error:
             if started:
                 session.close()
+            elif streamed and isinstance(error, media.YouTubeFormatUnavailable):
+                file_options = {**opts, "download": False, "convert": True}
+                return self.send_video(session, None, folder, file_options, check, url)
             raise
         check()
         self.progress = 100
