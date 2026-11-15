@@ -50,7 +50,7 @@ class Agent(ServiceInterface):
 class Advertisement(ServiceInterface):
     def __init__(self, name):
         super().__init__("org.bluez.LEAdvertisement1")
-        self.name = name
+        self.local_name = name
 
     @dbus_property(access=PropertyAccess.READ)
     def Type(self) -> "s":
@@ -58,7 +58,7 @@ class Advertisement(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def LocalName(self) -> "s":
-        return self.name
+        return self.local_name
 
     @method()
     def Release(self):
@@ -79,9 +79,10 @@ class UARTService(ServiceInterface):
 
 
 class Characteristic(ServiceInterface):
-    def __init__(self, read):
+    def __init__(self, mode, radio):
         super().__init__("org.bluez.GattCharacteristic1")
-        self.read = read
+        self.mode = mode
+        self.radio = radio
         self.notifying = False
         self.value = b""
         self.records = None
@@ -91,7 +92,7 @@ class Characteristic(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def UUID(self) -> "s":
-        return ("6E400004" if self.read else "6E400003") + BASE
+        return {"read": "6E400004", "notify": "6E400003", "write": "6E400002"}[self.mode] + BASE
 
     @dbus_property(access=PropertyAccess.READ)
     def Service(self) -> "o":
@@ -99,7 +100,7 @@ class Characteristic(ServiceInterface):
 
     @dbus_property(access=PropertyAccess.READ)
     def Flags(self) -> "as":
-        return ["read"] if self.read else ["notify"]
+        return [self.mode]
 
     @dbus_property(access=PropertyAccess.READ)
     def Value(self) -> "ay":
@@ -111,20 +112,27 @@ class Characteristic(ServiceInterface):
 
     @method()
     def StartNotify(self):
+        if self.mode != "notify":
+            raise DBusError("org.bluez.Error.NotSupported", "Notifications unavailable.")
         self.notifying = True
         self.emit_properties_changed({"Notifying": True})
 
     @method()
     def StopNotify(self):
         self.notifying = False
+        self.radio.audio_read.read_at = 0
+        self.radio.notification_limit = 20
         self.emit_properties_changed({"Notifying": False})
 
     @method()
     def ReadValue(self, options: "a{sv}") -> "ay":
-        if not self.read:
-            raise DBusError("org.bluez.Error.NotSupported", "Notifications only.")
+        if self.mode != "read":
+            raise DBusError("org.bluez.Error.NotSupported", "Reading unavailable.")
         if "offset" in options and options["offset"].value:
             raise DBusError("org.bluez.Error.InvalidOffset", "Unsupported offset.")
+        if not self.radio.tx.notifying:
+            return b"\0I"
+        self.radio.observe_mtu(options)
         self.read_at = asyncio.get_running_loop().time()
         if self.records is None:
             return b"\0I"
@@ -137,9 +145,20 @@ class Characteristic(ServiceInterface):
             self.records = None
         return record
 
+    @method()
+    def WriteValue(self, value: "ay", options: "a{sv}"):
+        if self.mode != "write" or not self.radio.tx.notifying:
+            raise DBusError("org.bluez.Error.NotSupported", "Subscribe before writing.")
+        if "offset" in options and options["offset"].value:
+            raise DBusError("org.bluez.Error.InvalidOffset", "Unsupported offset.")
+        if not 1 <= len(value) <= 20 or not all(32 <= byte <= 126 for byte in value):
+            raise DBusError("org.bluez.Error.InvalidValueLength", "Enter 1–20 printable ASCII characters.")
+        self.radio.observe_mtu(options)
+        self.radio.received_message = bytes(value).decode("ascii")
+
     def notify(self, value):
         if not self.notifying:
-            raise RuntimeError("Connect from Bluetooth Test and wait for the Nano to subscribe.")
+            raise RuntimeError("Connect from BLE Chat or Bluetooth Test and wait for the Nano to subscribe.")
         self.value = value
         self.emit_properties_changed({"Value": value})
 
@@ -154,8 +173,17 @@ class Radio:
         self.advertisement = None
         self.ad_lock = asyncio.Lock()
         self.uart_registered = False
-        self.tx = Characteristic(False)
-        self.rx = Characteristic(True)
+        self.tx = Characteristic("notify", self)
+        self.rx = Characteristic("write", self)
+        self.audio_read = Characteristic("read", self)
+        self.received_message = ""
+        self.notification_limit = 20
+        self.scan_stop = None
+        self.pair_task = None
+
+    def observe_mtu(self, options):
+        if "mtu" in options and options["mtu"].value >= 23:
+            self.notification_limit = min(64, options["mtu"].value - 3)
 
     async def interface(self, path, name):
         info = await self.bus.introspect("org.bluez", path)
@@ -165,7 +193,12 @@ class Radio:
         self.bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
         self.objects = await self.interface("/", "org.freedesktop.DBus.ObjectManager")
         self.adapter = await self.interface(self.path, "org.bluez.Adapter1")
-        await self.adapter.set_powered(True)
+        if not await self.adapter.get_powered():
+            try:
+                await self.adapter.set_powered(True)
+            except DBusError as error:
+                raise RuntimeError(f"Could not power on {self.path.rsplit('/', 1)[-1]} "
+                                   f"({error.type}: {error.text}). Check rfkill and bluetoothctl power on.") from error
         self.address = await self.adapter.get_address()
         self.agent_manager = await self.interface("/org/bluez", "org.bluez.AgentManager1")
         self.bus.export(ROOT + "/agent", Agent(self))
@@ -176,19 +209,20 @@ class Radio:
             await self.set_advertisement(uart)
 
     async def set_advertisement(self, uart):
-        name = "Nano UART" if uart else "NM-" + self.address.replace(":", "")
-        if self.advertisement and self.advertisement.name == name:
+        name = "Nano Bluetooth Link" if uart else "NM-" + self.address.replace(":", "")
+        if self.advertisement and self.advertisement.local_name == name:
             return
         ads = await self.interface(self.path, "org.bluez.LEAdvertisingManager1")
         if uart and not self.uart_registered:
             gatt = await self.interface(self.path, "org.bluez.GattManager1")
             self.bus.export(SERVICE, UARTService())
             self.bus.export(SERVICE + "/tx", self.tx)
-            self.bus.export(SERVICE + "/read", self.rx)
+            self.bus.export(SERVICE + "/read", self.audio_read)
+            self.bus.export(SERVICE + "/rx", self.rx)
             try:
                 await gatt.call_register_application(GATT_ROOT, {})
             except Exception:
-                for suffix in ("", "/tx", "/read"):
+                for suffix in ("", "/tx", "/read", "/rx"):
                     self.bus.unexport(SERVICE + suffix)
                 raise
             self.uart_registered = True
@@ -219,46 +253,82 @@ class Radio:
                                 "paired": props["Paired"].value, "path": path})
         return sorted(devices, key=lambda d: (not d["paired"], d["name"].lower()))
 
-    async def scan(self):
-        await self.adapter.call_set_discovery_filter({"Transport": Variant("s", "bredr")})
-        await self.adapter.call_start_discovery()
+    async def scan(self, target=None):
+        if self.scan_stop:
+            raise RuntimeError("A Bluetooth search is already running.")
+        self.scan_stop = stop = asyncio.Event()
         try:
-            await asyncio.sleep(8)
+            await self.adapter.call_set_discovery_filter({"Transport": Variant("s", "bredr")})
+            await self.adapter.call_start_discovery()
+            try:
+                if target is None:
+                    try:
+                        await asyncio.wait_for(stop.wait(), 8)
+                    except TimeoutError:
+                        pass
+                    return
+                deadline = asyncio.get_running_loop().time() + 8
+                while not stop.is_set() and asyncio.get_running_loop().time() < deadline:
+                    if any(device["path"] == target for device in await self.devices()):
+                        return
+                    await asyncio.sleep(.2)
+            finally:
+                await self.adapter.call_stop_discovery()
         finally:
-            await self.adapter.call_stop_discovery()
+            self.scan_stop = None
+
+    async def stop_scan(self):
+        if self.scan_stop:
+            self.scan_stop.set()
+
+    async def stop_pair(self):
+        if self.pair_task:
+            self.pair_task.cancel()
 
     async def pair(self, address):
-        if self.pairing_device:
+        if self.pair_task:
             raise RuntimeError("Pairing is already in progress.")
         path = self.path + "/dev_" + address.replace(":", "_")
+        self.pair_task = asyncio.current_task()
         self.pairing_device = path
         try:
+            if not any(device["path"] == path for device in await self.devices()):
+                await self.scan(path)
             try:
                 device = await self.interface(path, "org.bluez.Device1")
             except (DBusError, InterfaceNotFoundError) as error:
                 connect_device = getattr(self.adapter, "call_connect_device", None)
                 if connect_device is None:
-                    raise RuntimeError("Use Find devices to discover the Nano before pairing. "
-                                       "Keep Bluetooth open on the Nano if it isn't listed.") from error
-                path = await asyncio.wait_for(connect_device({"Address": Variant("s", address)}), 15)
+                    raise RuntimeError("The Pi could not discover the Nano. Keep Bluetooth settings open on "
+                                       "the Nano, then try Find Devices again.") from error
+                path = await asyncio.wait_for(connect_device({"Address": Variant("s", address)}), 12)
+                self.pairing_device = path
                 device = await self.interface(path, "org.bluez.Device1")
             if not await device.get_paired():
                 try:
                     await asyncio.wait_for(device.call_pair(), 60)
-                except TimeoutError:
-                    await device.call_cancel_pairing()
-                    raise RuntimeError("Pairing timed out.") from None
+                except (TimeoutError, asyncio.CancelledError) as error:
+                    try:
+                        await device.call_cancel_pairing()
+                    except DBusError:
+                        pass
+                    if isinstance(error, TimeoutError):
+                        raise RuntimeError("Pairing timed out.") from error
+                    raise
+        except asyncio.CancelledError as error:
+            raise RuntimeError("Pairing cancelled.") from error
         finally:
             self.pairing_device = None
+            self.pair_task = None
 
     async def confirm(self, value):
         if not self.confirmation or self.confirmation.done():
             raise RuntimeError("No pairing code is waiting for confirmation.")
         self.confirmation.set_result(value)
 
-    async def ble_audio(self, frames, packed, hash_value, quality, autoplay, mode, cancelled):
+    async def ble_audio(self, frames, packed, hash_value, quality, autoplay, mode, cancelled, progress):
         if not self.tx.notifying:
-            raise RuntimeError("Connect from Bluetooth Test first.")
+            raise RuntimeError("Connect from BLE Chat or Bluetooth Test first.")
         fast = mode == "fast"
         start = b"\0" + bytes([70 if fast else 83 if autoplay else 65 if quality == 1 else 81])
         start += struct.pack("<II", frames, hash_value)
@@ -266,7 +336,8 @@ class Radio:
             start += bytes([quality])
         if fast:
             start += bytes([autoplay])
-        step = 14 if mode == "read" else 18 if fast else 14
+        step = 15 if mode == "read" else self.notification_limit - (2 if fast else 6)
+        audio_read = self.audio_read
 
         def records():
             yield start
@@ -276,23 +347,34 @@ class Radio:
 
         try:
             if mode == "read":
-                self.rx.records = records()
-                self.rx.total = 1 + (len(packed) + step - 1) // step
-                self.rx.sent = 0
-                self.rx.read_at = asyncio.get_running_loop().time()
-                while self.rx.records is not None:
+                if not audio_read.read_at:
+                    raise RuntimeError("Wait for the Nano to start GATT reads.")
+                audio_read.records = records()
+                audio_read.total = 1 + (len(packed) + step - 1) // step
+                audio_read.sent = 0
+                audio_read.read_at = asyncio.get_running_loop().time()
+                while audio_read.records is not None:
                     cancelled()
-                    if not self.tx.notifying or asyncio.get_running_loop().time() - self.rx.read_at > 15:
+                    if not self.tx.notifying or asyncio.get_running_loop().time() - audio_read.read_at > 15:
                         raise RuntimeError("The Nano stopped reading audio.")
+                    progress(audio_read.sent * 100 // audio_read.total)
                     await asyncio.sleep(.05)
             else:
-                for packet in records():
+                total = 1 + (len(packed) + step - 1) // step
+                for i, packet in enumerate(records(), 1):
                     cancelled()
                     self.tx.notify(packet)
+                    progress(i * 100 // total)
                     await asyncio.sleep(.04)
         except InterruptedError:
-            if self.tx.notifying:
+            if mode == "read" and self.tx.notifying:
+                audio_read.records = iter((b"\0C",))
+                audio_read.total = audio_read.sent + 1
+                deadline = asyncio.get_running_loop().time() + 1
+                while audio_read.records and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(.05)
+            elif self.tx.notifying:
                 self.tx.notify(b"\0C")
             raise
         finally:
-            self.rx.records = None
+            audio_read.records = None

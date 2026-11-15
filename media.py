@@ -1,7 +1,11 @@
 """Media encoders and packet layouts shared with the Nano's C receivers."""
 import concurrent.futures
+from contextlib import contextmanager
 import json
+import math
+import os
 import re
+import signal
 import struct
 import subprocess
 import time
@@ -14,7 +18,13 @@ AUDIO = {
     "low": (7350, 1), "medium": (11025, 1), "high": (22050, 1),
     "fullMono": (44100, 1), "fullStereo": (44100, 2),
 }
-CRF = {"low": 32, "balanced": 23, "high": 17, "double": 13}
+VIDEO_QUALITY = {
+    "double": (128, 72, 0, 0), "compact": (192, 112, 160, 320),
+    "medium": (256, 144, 225, 480), "large": (320, 176, 320, 650),
+    "native": (432, 240, 500, 950),
+}
+FRAME_RATES = (5, 10, 15, 22, 30)
+IMA_BLOCK = 1024
 ID = re.compile(r"[A-Za-z0-9_-]{11}")
 GROUP = 12
 MAX_SAMPLE = 16 * 1024
@@ -45,16 +55,16 @@ def utf8(text, limit):
 
 
 def audio_header(size, hash_value, name, extension, token=0, cover=False):
-    magic = (b"NYC2" if cover else b"NYW2") if token else b"NCL1"
+    magic = (b"NYC3" if cover else b"NYW3") if token else (b"NYC1" if cover else b"NCL1")
     capacity = 44 if token else 48
     suffix = extension.encode("ascii")
-    stem = re.sub(r"[^A-Za-z0-9_-]", "_", Path(name).stem) or "Audio"
-    label = (stem.encode()[:capacity - len(suffix)] + suffix).ljust(capacity, b"\0")
+    stem = Path(name).stem or "Audio"
+    label = (utf8(stem, capacity - len(suffix)) + suffix).ljust(capacity, b"\0")
     return record(magic, words(size, hash_value) + label + (words(token) if token else b""))
 
 
 def process(args, check, timeout=180):
-    with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as child:
+    with subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as child:
         end = time.monotonic() + timeout
         try:
             while True:
@@ -70,34 +80,110 @@ def process(args, check, timeout=180):
                 raise RuntimeError(stderr.decode(errors="replace").strip()[-400:] or f"{args[0]} failed.")
             return stdout
         finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait()
+            stop_process(child)
 
 
-def audio_file(source, output, quality, mulaw, check):
+def audio_args(source, output, quality, adpcm):
     rate, channels = AUDIO[quality]
-    args = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", str(source),
-            "-map", "0:a:0", "-ac", str(channels), "-ar", str(rate)]
-    if not mulaw:
-        # Read one sample beyond the 300-second limit to detect long inputs.
-        args += ["-af", f"aresample={rate},atrim=end_sample={300 * rate + 1}"]
-    process(args + ["-c:a", "pcm_mulaw" if mulaw else "pcm_s16le",
-                    "-rf64", "never", "-fflags", "+bitexact", "-flags:a", "+bitexact", str(output)], check)
+    codec = ["-c:a", "adpcm_ima_wav", "-block_size", str(IMA_BLOCK)] if adpcm else ["-c:a", "pcm_mulaw"]
+    return ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", str(source), "-map", "0:a:0", "-vn",
+            "-ac", str(channels), "-ar", str(rate), *codec, "-rf64", "never", "-fflags", "+bitexact",
+            "-flags:a", "+bitexact", "-flush_packets", "1", str(output)]
+
+
+def samples_per_block(channels):
+    return (IMA_BLOCK - 4 * channels) * 2 // channels + 1
+
+
+def audio_file(source, output, quality, adpcm, check):
+    process(audio_args(source, output, quality, adpcm), check)
     size = output.stat().st_size
+    header_size = 60 if adpcm else 58
     with output.open("rb") as file:
-        header = file.read(58 if mulaw else 44)
-    header_size = len(header)
-    marker = 50 if mulaw else 36
-    if (header_size != marker + 8 or size <= header_size or size > UINT32_MAX
-            or header[:4] != b"RIFF" or header[marker:marker + 4] != b"data"):
+        header = file.read(header_size)
+    if (len(header) != header_size or not header_size < size <= UINT32_MAX
+            or header[:4] != b"RIFF" or header[-8:-4] != b"data"
+            or header[20] != (17 if adpcm else 7)
+            or struct.unpack_from("<I", header, 4)[0] != size - 8):
         raise ValueError("FFmpeg did not produce a compatible WAV.")
-    length = struct.unpack_from("<I", header, marker + 4)[0]
-    if size - header_size != length + (length & 1):
+    length = struct.unpack_from("<I", header, header_size - 4)[0]
+    if not length or size - header_size != length + (length & 1):
         raise ValueError("The WAV length is invalid.")
-    if not mulaw and length > rate * channels * 2 * 300:
-        raise ValueError("Classic Files and Stream accept audio up to five minutes.")
+    if adpcm:
+        frames = struct.unpack_from("<I", header, 48)[0]
+        samples = samples_per_block(AUDIO[quality][1])
+        if not frames or (frames + samples - 1) // samples * IMA_BLOCK != length:
+            raise ValueError("The IMA ADPCM block count is invalid.")
     return size
+
+
+def stop_process(child):
+    if child.poll() is None:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+
+
+@contextmanager
+def download_stream(url, folder, video, check):
+    formats = ("b[height<=480][protocol^=m3u8]/b[height<=480][ext=webm]/b[height<=480][ext=mp4]"
+               if video else "ba[ext=webm]/ba/b")
+    args = [*YT_DLP, "--no-playlist", "--hls-use-mpegts", "-f", formats, "-o", "-", "--", youtube_url(url)]
+    with (folder / "yt-dlp-stream.log").open("w+b") as log, subprocess.Popen(
+            args, stdout=subprocess.PIPE, stderr=log, start_new_session=True) as child:
+        def validate():
+            while child.poll() is None:
+                check()
+                time.sleep(.05)
+            if child.returncode:
+                log.seek(0)
+                raise RuntimeError(log.read().decode(errors="replace").strip()[-400:] or "YouTube download failed.")
+
+        try:
+            yield child.stdout, validate
+        except Exception:
+            if child.poll() not in (None, 0):
+                validate()
+            raise
+        finally:
+            stop_process(child)
+
+
+def audio_blocks(source, output, quality, check):
+    with subprocess.Popen(audio_args("pipe:0", output, quality, True), stdin=source,
+                          stderr=subprocess.DEVNULL, start_new_session=True) as child:
+        position = 0
+        try:
+            while True:
+                check()
+                active = child.poll() is None
+                if not active and child.returncode:
+                    raise RuntimeError("Could not convert the YouTube audio stream.")
+                size = output.stat().st_size if output.exists() else 0
+                available = max(0, size - 60 - position)
+                count = min(8 * IMA_BLOCK, available // IMA_BLOCK * IMA_BLOCK)
+                if count:
+                    with output.open("rb") as file:
+                        if not position:
+                            header = file.read(60)
+                            if header[20] != 17 or header[-8:-4] != b"data":
+                                raise ValueError("Unexpected streamed audio format.")
+                        file.seek(60 + position)
+                        blocks = file.read(count)
+                    if len(blocks) != count:
+                        raise OSError("Incomplete encoded audio blocks.")
+                    position += count
+                    yield blocks
+                elif active:
+                    time.sleep(.035)
+                elif not position or available:
+                    raise ValueError("The YouTube audio stream ended without complete audio blocks.")
+                else:
+                    break
+        finally:
+            stop_process(child)
 
 
 def annex_b(data):
@@ -105,21 +191,25 @@ def annex_b(data):
     sps = pps = None
     samples = []
     for i, marker in enumerate(starts):
-        end = starts[i + 1].start() if i + 1 < len(starts) else len(data)
+        end = starts[i + 1].start() if i + 1 < len(starts) else len(data.rstrip(b"\0"))
         nal = data[marker.end():end]
         if not nal:
-            continue
+            raise ValueError("FFmpeg returned an empty H.264 NAL unit.")
         kind = nal[0] & 31
         if kind == 7:
+            if sps is not None and sps != nal:
+                raise ValueError("H.264 sequence parameters changed within a group.")
             sps = nal
         elif kind == 8:
+            if pps is not None and pps != nal:
+                raise ValueError("H.264 picture parameters changed within a group.")
             pps = nal
         elif kind in (1, 5):
             if len(nal) + 4 > MAX_SAMPLE or (not samples and kind != 5):
                 raise ValueError("Encoded frame exceeds the Nano decoder limits.")
             samples.append(struct.pack(">I", len(nal)) + nal)
     if (not sps or not pps or not 1 <= len(samples) <= GROUP or
-            len(sps) < 5 or sps[1] != 66 or sps[3] > 30 or 11 + len(sps) + len(pps) > 128):
+            len(sps) < 5 or len(pps) < 2 or sps[1] != 66 or sps[3] > 30 or 11 + len(sps) + len(pps) > 128):
         raise ValueError("FFmpeg did not produce a compatible H.264 group.")
     config = bytes((1, sps[1], sps[2], sps[3], 255, 225))
     config += struct.pack(">H", len(sps)) + sps + b"\1" + struct.pack(">H", len(pps)) + pps
@@ -132,59 +222,78 @@ def video_frame_estimate(source, fps, check):
     info = json.loads(raw)
     for stream in [*info.get("streams", ()), info.get("format", {})]:
         try:
-            frames = round(float(stream["duration"]) * fps)
-        except (KeyError, ValueError, OverflowError):
+            frames = math.ceil(float(stream["duration"]) * fps)
+        except (KeyError, TypeError, ValueError, OverflowError):
             continue
-        if frames > 0:
+        if 0 < frames < UINT32_MAX:
             return frames
     return None
 
 
-def video_records(source, folder, quality, fps, audio, live, check):
+def video_records(source, folder, quality, fps, audio, live, check, *, adpcm=False, stream=None):
     rate, channels = AUDIO[audio]
-    streams = process(["ffprobe", "-v", "error", "-select_streams", "a:0",
-                       "-show_entries", "stream=index", "-of", "csv=p=0", str(source)], check)
-    audio_path = folder / "sound.ulaw"
-    scale = ("scale=128:72:force_original_aspect_ratio=increase:force_divisible_by=2:"
-             "out_color_matrix=bt601:out_range=tv,crop=128:72,pad=128:128:0:28,setsar=1")
-    args = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", str(source), "-map", "0:v:0", "-an",
-            "-vf", f"fps={fps}:start_time=0:round=up:eof_action=pass,{scale}",
-            "-c:v", "libx264", "-threads", "1", "-profile:v", "baseline", "-level:v", "3.0",
-            "-pix_fmt", "yuv420p", "-tune", "zerolatency", "-crf", str(CRF[quality]),
-            "-color_range", "tv", "-colorspace", "smpte170m",
-            "-x264-params", "keyint=12:scenecut=0:bframes=0:ref=1:slices=1:repeat-headers=1",
-            "-f", "segment", "-segment_time", str(GROUP / fps), "-segment_time_delta", str(.5 / fps),
+    groups = GROUP if quality == "double" else 4
+    has_audio = stream is not None or bool(process(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=index",
+         "-of", "csv=p=0", str(source)], check))
+    audio_path = folder / "sound.raw"
+    width, height, live_cap, saved_cap = VIDEO_QUALITY[quality]
+    dimensions = f"{width}:{height}"
+    scale = (f"scale={dimensions}:force_original_aspect_ratio=increase:force_divisible_by=2:"
+             f"out_color_matrix=bt601:out_range=tv,crop={dimensions}")
+    if quality == "double":
+        scale += ",pad=128:128:0:28"
+    cap = live_cap if live else saved_cap
+    limits = ["-maxrate", f"{cap}k", "-bufsize", f"{min(cap // 2, 110)}k"] if cap else []
+    params = (f"keyint={groups}:scenecut=0:bframes=0:ref=1:slices=1:repeat-headers=1:sliced-threads=0"
+              + (":force-cfr=1" if cap else ""))
+    args = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-i", "pipe:0" if stream is not None else str(source),
+            "-map", "0:v:0", "-an", "-vf", f"fps={fps}:start_time=0:round=up:eof_action=pass,{scale},setsar=1",
+            "-c:v", "libx264", "-threads", str(min(4, os.cpu_count() or 1)), "-thread_type", "frame",
+            "-profile:v", "baseline", "-level:v", "3.0", "-pix_fmt", "yuv420p", "-tune", "zerolatency",
+            "-crf", "13" if quality == "double" else "24", "-color_range", "tv", "-colorspace", "smpte170m",
+            *limits, "-x264-params", params,
+            "-f", "segment", "-segment_time", str(groups / fps), "-segment_time_delta", str(.5 / fps),
             "-reset_timestamps", "1", "-segment_format", "h264", str(folder / "%08d.h264")]
-    if streams:
-        args += ["-map", "0:a:0", "-vn", "-af", f"aresample={rate}:async=1:first_pts=0",
-                 "-ac", str(channels), "-ar", str(rate), "-c:a", "pcm_mulaw", "-flush_packets", "1",
-                 "-f", "mulaw", str(audio_path)]
+    if has_audio:
+        args += ["-map", "0:a:0", "-vn", "-af", f"aresample={rate}:async=1:first_pts=0", "-ac", str(channels),
+                 "-ar", str(rate), "-c:a", "pcm_s16le" if adpcm else "pcm_mulaw", "-flush_packets", "1",
+                 "-f", "s16le" if adpcm else "mulaw", str(audio_path)]
     config = None
     frames = index = 0
-    with (folder / "ffmpeg.log").open("w+b") as log, subprocess.Popen(args, stderr=log) as child:
+    width_bytes = channels * (2 if adpcm else 1)
+    with (folder / "ffmpeg.log").open("w+b") as log, subprocess.Popen(
+            args, stdin=stream, stderr=log, start_new_session=True) as child:
         try:
             while True:
                 check()
+                active = child.poll() is None
                 segment = folder / f"{index:08d}.h264"
-                if child.poll() is None and not (folder / f"{index + 1:08d}.h264").exists():
+                if active and not (folder / f"{index + 1:08d}.h264").exists():
                     time.sleep(.025)
                     continue
-                if child.poll() not in (None, 0):
+                if not active and child.returncode:
                     log.seek(0)
                     raise RuntimeError(log.read().decode(errors="replace").strip()[-400:] or "H.264 encoding failed.")
                 if not segment.exists():
                     break
                 avcc, samples = annex_b(segment.read_bytes())
+                if len(samples) > groups or (active and len(samples) != groups):
+                    raise ValueError("FFmpeg returned an unsupported H.264 group.")
                 if config is None:
                     config = avcc
-                    yield (b"NVL2" if live else b"NVD2") + words(len(config), fps, rate, channels) + config
+                    tag = b"NVL" if live else b"NVD"
+                    flags = channels | (0x80000000 if adpcm else 0)
+                    yield tag + (b"2" if groups == GROUP else b"3") + words(len(config), fps, rate, flags) + config
                 elif config != avcc:
                     raise ValueError("H.264 configuration changed mid-clip.")
-                start = (frames * rate // fps) * channels
+                start = (frames * rate // fps) * width_bytes
                 frames += len(samples)
-                stop = (frames * rate // fps) * channels
+                if frames >= UINT32_MAX:
+                    raise ValueError("Invalid video duration.")
+                stop = (frames * rate // fps) * width_bytes
                 sound = b""
-                if streams:
+                if has_audio:
                     while child.poll() is None and (not audio_path.exists() or audio_path.stat().st_size < stop):
                         check()
                         time.sleep(.025)
@@ -192,20 +301,20 @@ def video_records(source, folder, quality, fps, audio, live, check):
                         with audio_path.open("rb") as file:
                             file.seek(start)
                             sound = file.read(stop - start)
-                body = b"".join(words(len(s)) + s for s in samples) + sound.ljust(stop - start, b"\xff")
+                if adpcm:
+                    sound = sound[:len(sound) // width_bytes * width_bytes].ljust(stop - start, b"\0")
+                    sound = video_adpcm(sound, channels)
+                else:
+                    sound = sound.ljust(stop - start, b"\xff")
+                body = b"".join(words(len(sample)) + sample for sample in samples) + sound
                 yield words(len(body), len(samples), checksum(body)) + body
                 segment.unlink()
                 index += 1
-            if child.wait() != 0:
-                log.seek(0)
-                raise RuntimeError(log.read().decode(errors="replace").strip()[-400:] or "H.264 encoding failed.")
-            if not frames or frames >= UINT32_MAX:
+            if not frames:
                 raise ValueError("Invalid video duration.")
             yield words(0, frames, 0)
         finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait()
+            stop_process(child)
 
 
 def youtube_url(value):
@@ -224,7 +333,7 @@ def download(url, folder, video, check):
     output = str(folder / "YouTube.%(ext)s")
     args = (["-f", "bv[height<=480][vcodec^=avc1][ext=mp4]+ba[ext=m4a]/b[height<=480][vcodec^=avc1][ext=mp4]",
              "--merge-output-format", "mp4"] if video else
-            ["-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "m4a"])
+            ["-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "m4a", "--write-thumbnail"])
     process([*YT_DLP, "--no-playlist", *args, "-o", output, "--", youtube_url(url)], check, timeout=900)
     file = folder / ("YouTube.mp4" if video else "YouTube.m4a")
     if not file.is_file():
@@ -241,7 +350,26 @@ def search(query, video, check):
     def entries(target):
         raw = process([*YT_DLP, "--flat-playlist", "--playlist-items", "1:8", "--dump-json", "--", target],
                       check, timeout=45)
-        return [json.loads(line) for line in raw.splitlines()]
+        rows = {}
+        for line in raw.splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(row, dict):
+                continue
+            key, title = row.get("id"), row.get("title")
+            if not isinstance(key, str) or not ID.fullmatch(key) or not isinstance(title, str) or not title.strip():
+                continue
+            names = [row.get("channel"), row.get("uploader")]
+            if not video:
+                names.insert(0, row.get("artist"))
+            author = next((name for name in names if isinstance(name, str) and name), "")
+            if not video:
+                author = author.removesuffix(" - Topic")
+            rows.setdefault(key, {"id": key, "title": title, "author": author,
+                                  "thumbnail": row.get("thumbnail"), "thumbnails": row.get("thumbnails") or []})
+        return list(rows.values())[:8]
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
         lists = []
@@ -252,21 +380,18 @@ def search(query, video, check):
             except (RuntimeError, TimeoutError, ValueError) as error:
                 errors.append(error)
         if not lists:
-            raise errors[0]
+            if video:
+                raise errors[0]
+            raise RuntimeError("YouTube Music search failed. Check the connection and yt-dlp.") from errors[0]
     results = {}
     for index in range(8):
         for rows in lists:
-            if index >= len(rows):
-                continue
-            row = rows[index]
-            key, title = row.get("id"), row.get("title")
-            if isinstance(key, str) and ID.fullmatch(key) and isinstance(title, str) and title.strip():
-                author = (None if video else row.get("artist")) or row.get("channel") or row.get("uploader")
-                if not video and isinstance(author, str):
-                    author = author.removesuffix(" - Topic")
-                results.setdefault(key, {"id": key, "title": title, "author": author if isinstance(author, str) else "",
-                                         "thumbnails": row.get("thumbnails") or []})
+            if index < len(rows):
+                row = rows[index]
+                results.setdefault(row["id"], row)
     rows = list(results.values())[:8]
+    if not rows:
+        raise RuntimeError("No videos found on YouTube." if video else "No tracks found on YouTube Music.")
 
     def attribute(row):
         if not row["author"]:
@@ -285,37 +410,60 @@ def search(query, video, check):
         return list(pool.map(attribute, rows))
 
 
-def artwork(result, side, video):
+def image_pixels(source, side, video):
     from PIL import Image, ImageOps
+
+    with Image.open(source) as original:
+        image = ImageOps.exif_transpose(original).convert("RGB")
+    if video:
+        fitted = ImageOps.contain(image, (side, side), Image.Resampling.LANCZOS)
+        image = Image.new("RGB", (side, side))
+        image.paste(fitted, ((side - fitted.width) // 2, (side - fitted.height) // 2))
+    else:
+        image = ImageOps.fit(image, (side, side), Image.Resampling.LANCZOS)
+    pixels = bytearray(side * side * 2)
+    for i, (r, g, b) in enumerate(image.getdata()):
+        struct.pack_into("<H", pixels, i * 2, (r >> 3) << 11 | (g >> 2) << 5 | (b >> 3))
+    return bytes(pixels)
+
+
+def cover_pixels(folder):
+    for file in folder.glob("YouTube.*"):
+        if file.suffix.lower() in (".jpg", ".jpeg", ".png", ".webp", ".avif"):
+            try:
+                return image_pixels(file, 160, False)
+            except (OSError, ValueError):
+                continue
+    return None
+
+
+def artwork(result, side, video):
     from io import BytesIO
 
     fallback = f"https://i.ytimg.com/vi/{result['id']}/mqdefault.jpg"
-    urls = [fallback]
-    if not video:
-        urls[:0] = [entry.get("url", "") for entry in result["thumbnails"] if isinstance(entry, dict)]
-    for url in dict.fromkeys(urls[:4] + [fallback]):
+    high = f"https://i.ytimg.com/vi/{result['id']}/hqdefault.jpg"
+    thumbs = [entry["url"] for entry in result["thumbnails"]
+              if isinstance(entry, dict) and isinstance(entry.get("url"), str)]
+    square = next((url for url in thumbs if (urllib.parse.urlsplit(url).hostname or "")
+                   .endswith((".ggpht.com", ".googleusercontent.com"))), "")
+    primary = result.get("thumbnail")
+    if not isinstance(primary, str):
+        primary = ""
+    tail = thumbs[-1] if thumbs else ""
+    urls = [primary, fallback, high, tail] if video else [square, primary, tail, fallback, high]
+    for url in dict.fromkeys(urls):
         try:
             host = urllib.parse.urlsplit(url).hostname or ""
             if not url.startswith("https://") or not host.endswith((".ytimg.com", ".ggpht.com", ".googleusercontent.com")):
                 continue
             with urllib.request.urlopen(url, timeout=4) as response:
                 data = response.read(2_000_001)
-            if len(data) > 2_000_000:
-                continue
-            image = Image.open(BytesIO(data)).convert("RGB")
-            if video:
-                fitted = ImageOps.contain(image, (side, side), Image.Resampling.LANCZOS)
-                image = Image.new("RGB", (side, side))
-                image.paste(fitted, ((side - fitted.width) // 2, (side - fitted.height) // 2))
-            else:
-                image = ImageOps.fit(image, (side, side), Image.Resampling.LANCZOS)
-            pixels = bytearray(side * side * 2)
-            for i, (r, g, b) in enumerate(image.getdata()):
-                struct.pack_into("<H", pixels, i * 2, (r >> 3) << 11 | (g >> 2) << 5 | (b >> 3))
-            return bytes(pixels)
+            if len(data) <= 2_000_000:
+                return image_pixels(BytesIO(data), side, video)
         except (OSError, ValueError):
             continue
     return None
+
 
 IMA_STEPS = (
     7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45,
@@ -325,6 +473,38 @@ IMA_STEPS = (
     4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493, 10442, 11487, 12635, 13899,
     15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
 )
+
+
+def video_adpcm(pcm, channels):
+    frames = len(pcm) // (2 * channels)
+    if not frames:
+        return b""
+    groups = (frames + 6) // 8
+    stride = 4 * channels
+    encoded = bytearray(stride * (1 + groups))
+    samples = struct.unpack(f"<{frames * channels}h", pcm)
+    index_change = (-1, -1, -1, -1, 2, 4, 6, 8)
+    for channel in range(channels):
+        predictor = samples[channel]
+        difference = abs(samples[channels + channel] - predictor) if frames > 1 else 0
+        index = next((i for i, step in enumerate(IMA_STEPS) if step >= difference), 88)
+        struct.pack_into("<hBB", encoded, 4 * channel, predictor, index, 0)
+        for frame in range(1, frames):
+            error = samples[frame * channels + channel] - predictor
+            remaining = abs(error)
+            step = IMA_STEPS[index]
+            delta, magnitude = step >> 3, 0
+            for bit, part in ((4, step), (2, step >> 1), (1, step >> 2)):
+                if remaining >= part:
+                    remaining -= part
+                    magnitude |= bit
+                    delta += part
+            predictor = max(-32768, min(32767, predictor + (-delta if error < 0 else delta)))
+            index = max(0, min(88, index + index_change[magnitude]))
+            group, nibble = divmod(frame - 1, 8)
+            at = (group + 1) * stride + channel * 4 + nibble // 2
+            encoded[at] |= (magnitude | (8 if error < 0 else 0)) << (4 * (nibble % 2))
+    return bytes(encoded)
 
 
 def ble_clip(source, quality, check):

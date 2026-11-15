@@ -13,15 +13,15 @@ import threading
 from urllib.parse import parse_qs, urlsplit
 
 import media
-from sender import ADDRESS, DESTINATIONS, VIDEO, YOUTUBE, Sender
+from sender import ADDRESS, DEFAULTS, DESTINATIONS, Sender
 
 PAGE = Path(__file__).with_name("index.html")
 MAX_UPLOAD = media.UINT32_MAX
 
 
 def address(value):
-    value = value.upper().strip()
-    if not ADDRESS.fullmatch(value):
+    value = value.upper().strip().replace("-", ":") if isinstance(value, str) else ""
+    if not ADDRESS.fullmatch(value) or value in ("00:00:00:00:00:00", "FF:FF:FF:FF:FF:FF", "02:00:00:00:00:00"):
         raise ValueError("Enter a Bluetooth address such as AA:BB:CC:DD:EE:FF.")
     return value
 
@@ -35,6 +35,7 @@ class App:
             self.saved = address(json.loads(self.settings_file.read_text())["address"])
         except (OSError, KeyError, ValueError, TypeError, AttributeError):
             self.saved = ""
+        self.connection_lock = threading.Lock()
         self.radio = None
         self.radio_error = None
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
@@ -46,10 +47,7 @@ class App:
 
         self.radio = Radio(adapter)
         await self.radio.start()
-        try:
-            await self.radio.advertise(False)
-        except Exception as error:
-            self.radio_error = f"BLE discovery unavailable. Enter the Pi address manually. {error}"
+        await self.advertising(False)
 
     def call(self, coroutine, timeout=70):
         future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
@@ -59,13 +57,26 @@ class App:
             future.cancel()
             raise
 
+    async def advertising(self, ble):
+        try:
+            await self.radio.advertise(ble)
+        except Exception as error:
+            prefix = "BLE advertising unavailable." if ble else "Use Mac Address on the Nano and enter the Pi address."
+            self.radio_error = f"{prefix} {error}"
+        else:
+            self.radio_error = None
+
     async def radio_state(self):
         if self.radio is None:
             return {}
-        return {"pi": self.radio.address, "pairCode": self.radio.prompt, "radioError": self.radio_error,
-                "bleReady": self.radio.tx.notifying,
-                "devices": [{"address": d["address"], "name": d["name"], "paired": d["paired"]}
-                            for d in await self.radio.devices()]}
+        return {
+            "pi": self.radio.address, "pairCode": self.radio.prompt, "radioError": self.radio_error,
+            "scanning": self.radio.scan_stop is not None, "pairing": self.radio.pair_task is not None,
+            "bleReady": self.radio.tx.notifying, "bleReadReady": bool(self.radio.audio_read.read_at),
+            "receivedMessage": self.radio.received_message, "bleLimit": self.radio.notification_limit,
+            "devices": [{key: device[key] for key in ("address", "name", "paired")}
+                        for device in await self.radio.devices()],
+        }
 
     def remember(self, peer):
         self.settings_file.parent.mkdir(parents=True, exist_ok=True)
@@ -79,17 +90,21 @@ class App:
         self.saved = peer
 
     def options(self, values):
-        playback = values.get("playback", "after")
-        fps = int(values.get("fps", 5))
-        audio, quality = values.get("audio", "low"), values.get("quality", "balanced")
-        convert = values.get("convert", False)
-        if audio not in media.AUDIO or quality not in media.CRF or fps not in (5, 10, 15, 30):
-            raise ValueError("Choose a supported quality and frame rate.")
-        if playback not in ("after", "live") or not isinstance(convert, bool):
-            raise ValueError("Invalid playback settings.")
+        destination = values.get("destination")
+        if destination not in DEFAULTS:
+            raise ValueError("Choose YT Music or YT Video.")
+        defaults = DEFAULTS[destination]
+        options = {key: values.get(key, value) for key, value in defaults.items()}
+        playback = ("after", "live", "test") if destination == "youtubeAudio" else ("after", "live")
+        if (options["audio"] not in media.AUDIO or options["playback"] not in playback
+                or not isinstance(options["download"], bool)):
+            raise ValueError("Choose a supported audio quality and playback mode.")
+        if destination == "youtubeVideo" and (options["quality"] not in media.VIDEO_QUALITY
+                or options["fps"] not in media.FRAME_RATES or type(options["fps"]) is not int
+                or not isinstance(options["convert"], bool)):
+            raise ValueError("Choose a supported video quality and frame rate.")
         with self.sender.lock:
-            self.sender.options = {"audio": audio, "quality": quality, "fps": fps,
-                                   "playback": playback, "convert": convert}
+            self.sender.options[destination] = options
 
     def state(self):
         return {**self.sender.snapshot(), **self.call(self.radio_state(), 5), "saved": self.saved}
@@ -99,22 +114,38 @@ class App:
         if action == "settings":
             self.options(payload)
         elif action == "mode":
-            self.call(self.radio.advertise(destination == "ble"))
+            if destination != "ble" and destination not in DESTINATIONS:
+                raise ValueError("Choose a sender tab.")
+            self.call(self.advertising(destination == "ble"))
         elif action == "scan":
             self.call(self.radio.scan())
-        elif action == "pair":
-            peer = address(payload.get("address", ""))
-            self.call(self.radio.pair(peer))
-            self.remember(peer)
-        elif action == "confirm":
-            self.call(self.radio.confirm(payload.get("accept") is True))
-        elif action == "connect":
+        elif action == "stopScan":
+            self.call(self.radio.stop_scan())
+        elif action in ("pair", "connect"):
             peer = address(payload.get("address", ""))
             if destination not in DESTINATIONS:
-                raise ValueError("Choose a Classic destination.")
-            self.options(payload)
-            self.sender.connect(peer, destination, self.radio.address)
-            self.remember(peer)
+                raise ValueError("Choose YT Music or YT Video.")
+            if not self.connection_lock.acquire(blocking=False):
+                raise RuntimeError("A Bluetooth connection is already being set up.")
+            try:
+                if action == "connect":
+                    self.options(payload)
+                    self.sender.status = "Pairing or connecting to the Nano…"
+                self.call(self.radio.pair(peer), timeout=90)
+                self.remember(peer)
+                if action == "connect":
+                    self.sender.connect(peer, destination, self.radio.address)
+                else:
+                    self.sender.status = "Paired. Open the matching app on the Nano and click Connect."
+            except Exception as error:
+                self.sender.status = str(error)
+                raise
+            finally:
+                self.connection_lock.release()
+        elif action == "stopPair":
+            self.call(self.radio.stop_pair())
+        elif action == "confirm":
+            self.call(self.radio.confirm(payload.get("accept") is True))
         elif action == "disconnect":
             self.sender.disconnect()
         elif action == "cancel":
@@ -122,10 +153,8 @@ class App:
                 if self.sender.job:
                     self.sender.job.set()
         elif action in ("search", "link"):
-            if action == "search" and destination not in YOUTUBE:
-                raise ValueError("Choose a YouTube tab.")
-            if action == "link" and destination not in (*YOUTUBE, "stream"):
-                raise ValueError("Choose Stream or a YouTube tab.")
+            if destination not in DESTINATIONS:
+                raise ValueError("Choose YT Music or YT Video.")
             self.options(payload)
             session = self.sender.require(destination)
             value = payload.get("value", "").strip()
@@ -138,11 +167,16 @@ class App:
                 self.sender.launch(lambda folder, opts, check: self.sender.send_youtube(
                     session, value, folder, opts, check), session)
         elif action == "message":
+            with self.sender.lock:
+                if self.sender.job is not None:
+                    raise RuntimeError("Wait for the current transfer to finish.")
             value = payload.get("value", "")
-            if not 1 <= len(value) <= 20 or not all(32 <= ord(c) <= 126 for c in value):
-                raise ValueError("Enter 1–20 printable ASCII characters.")
+            if not isinstance(value, str) or not value or not all(32 <= ord(c) <= 126 for c in value):
+                raise ValueError("Enter printable ASCII text.")
 
             async def notify():
+                if len(value) > self.radio.notification_limit:
+                    raise ValueError(f"Keep the message to {self.radio.notification_limit} characters or fewer.")
                 self.radio.tx.notify(value.encode())
             self.call(notify())
         else:
@@ -155,15 +189,18 @@ class App:
             mode = options.get("transport")
             if not quality or mode not in ("read", "notify", "fast"):
                 raise ValueError("Choose a supported BLE audio quality and transport.")
-            if not self.call(self.radio_state(), 5).get("bleReady"):
-                raise RuntimeError("Connect from Bluetooth Test and wait for the Nano to subscribe.")
+            state = self.call(self.radio_state(), 5)
+            if not state.get("bleReady") or (mode == "read" and not state.get("bleReadReady")):
+                raise RuntimeError("Connect from BLE Chat or Bluetooth Test and wait for the Nano to be ready.")
 
             def send(folder, opts, check):
                 self.sender.status = "Preparing BLE audio…"
                 clip = media.ble_clip(source, quality, check)
                 self.sender.status = "Sending BLE audio…"
-                self.call(self.radio.ble_audio(*clip, quality, options.get("autoplay") is True, mode, check),
-                          timeout=1200)
+                def progress(percent):
+                    self.sender.progress = percent
+                self.call(self.radio.ble_audio(*clip, quality, options.get("autoplay") is True, mode, check, progress),
+                          timeout=2400)
                 self.sender.progress = 100
                 self.sender.status = "Audio sent."
 
@@ -173,12 +210,20 @@ class App:
         session = self.sender.require(destination)
 
         def send(folder, opts, check):
-            if destination in VIDEO:
+            if destination == "youtubeVideo":
                 self.sender.send_video(session, source, folder, opts, check)
             else:
                 self.sender.send_audio(session, source, folder, opts, check, name)
 
-        self.sender.launch(send, session, cleanup=cleanup)
+        def report_failure(folder, opts, check):
+            try:
+                send(folder, opts, check)
+            except Exception as error:
+                if not session.closed.is_set():
+                    self.sender.send_status(session, str(error), check)
+                raise
+
+        self.sender.launch(report_failure, session, cleanup=cleanup)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -281,7 +326,7 @@ def main():
             server.app = App(args.adapter)
         except Exception as error:
             parser.exit(1, f"Bluetooth setup failed: {error}\n")
-        print(f"Nano Sender listening on {bind}:{args.port}", flush=True)
+        print(f"Nano Bluetooth Link listening on {bind}:{args.port}", flush=True)
         try:
             server.serve_forever()
         except KeyboardInterrupt:

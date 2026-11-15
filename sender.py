@@ -12,10 +12,12 @@ from pathlib import Path
 
 import media
 
-DESTINATIONS = {"inbox": 0x1003, "stream": 0x1005, "video": 0x1007,
-                "youtubeAudio": 0x1009, "youtubeVideo": 0x100B}
-VIDEO = {"video", "youtubeVideo"}
-YOUTUBE = {"youtubeAudio", "youtubeVideo"}
+DESTINATIONS = {"youtubeAudio": 0x1009, "youtubeVideo": 0x100B}
+DEFAULTS = {
+    "youtubeAudio": {"audio": "low", "playback": "live", "download": False},
+    "youtubeVideo": {"audio": "medium", "playback": "after", "download": False,
+                     "quality": "medium", "fps": 15, "convert": False},
+}
 ADDRESS = re.compile(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")
 
 
@@ -50,10 +52,12 @@ class Session:
         self.closed = threading.Event()
         self.condition = threading.Condition()
         self.credit = self.token = 0
-        self.last_credit = time.monotonic()
-        self.paused = self.artwork = self.video_ready = False
+        self.paused = self.artwork = self.awaiting_video = False
+        self.audio_revision = self.video_revision = 0
+        self.video_progress = False
+        self.error = None
+        self.audio_epoch = None
         self.results = {}
-        self.finished = False
 
     def start(self):
         threading.Thread(target=self.receive, daemon=True).start()
@@ -79,30 +83,11 @@ class Session:
                     continue
                 if not data:
                     break
-                request = False
                 with self.condition:
-                    if data == b"NYH1":
-                        self.artwork = True
-                    elif data == b"NYZ1":
-                        self.paused = True
-                    elif data == b"NYZ0":
-                        self.paused = False
-                        self.last_credit = time.monotonic()
-                    elif data == b"NYV1":
-                        self.video_ready = True
-                    elif data[:4] == b"NYG1" and len(data) == 8 and self.destination in VIDEO:
-                        self.update_credit(struct.unpack_from("<I", data, 4)[0])
-                    elif data[:4] == b"NYF1" and len(data) == 12 and self.destination == "youtubeAudio":
-                        token, limit = struct.unpack_from("<II", data, 4)
-                        if token == self.token and token:
-                            self.update_credit(limit)
-                    elif self.destination in YOUTUBE and (
-                            data[:4] == b"NYQ1" and 4 < len(data) <= 48
-                            or data[:4] == b"NYP1" and len(data) == 15):
-                        if self.destination == "youtubeVideo":
-                            self.artwork = True
-                        request = True
+                    request = self.receive_packet(data)
                     self.condition.notify_all()
+                if self.error:
+                    break
                 if request:
                     self.on_request(self, data)
         except OSError:
@@ -111,42 +96,96 @@ class Session:
             self.close()
             self.on_close(self)
 
-    def update_credit(self, limit):
-        if limit >= self.credit:
-            self.credit = limit
-            self.last_credit = time.monotonic()
+    def receive_packet(self, data):
+        if data == b"NYH1":
+            self.artwork = True
+        if self.destination == "youtubeAudio":
+            if data in (b"NYL3", b"NYL4", b"NYL5", b"NYL6"):
+                self.audio_revision = max(self.audio_revision, data[3] - ord("0"))
+                self.artwork = True
+            elif len(data) == 8 and data[:4] in (b"NYZ2", b"NYZ3"):
+                token, = struct.unpack_from("<I", data, 4)
+                if self.token and token == self.token:
+                    self.paused = data[:4] == b"NYZ2"
+                    if not self.paused:
+                        self.audio_epoch = None
+        else:
+            if data in (b"NVQ2", b"NVQ3", b"NVQ4", b"NVQ5", b"NVQ6"):
+                self.video_revision = max(self.video_revision, data[3] - ord("0"))
+                self.artwork = True
+            elif data == b"NVP1":
+                self.video_progress = self.artwork = True
+            elif data in (b"NYZ1", b"NYZ0"):
+                self.paused = data == b"NYZ1"
+            elif data == b"NYV1":
+                self.awaiting_video = False
+            elif data.startswith(b"NVF1") and len(data) > 4:
+                detail = data[4:].split(b"\0", 1)[0].decode("utf-8", "replace")
+                self.error = f"Nano: {detail}"
+            elif len(data) == 8 and data.startswith(b"NYG1"):
+                self.credit = max(self.credit, struct.unpack_from("<I", data, 4)[0])
+        request = (data.startswith(b"NYQ1") and len(data) > 4 or
+                   data.startswith(b"NYP1") and len(data) >= 15 and not any(data[15:]))
+        if request and self.destination == "youtubeVideo":
+            self.artwork = True
+        return request
+
+    def wait_for(self, supported, check, message):
+        deadline = time.monotonic() + 2.5
+        with self.condition:
+            while not supported():
+                check()
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(message)
+                self.condition.wait(min(.1, remaining))
 
     def begin_flow(self, token=0):
         with self.condition:
             self.credit = 0
             self.token = token
-            self.paused = self.video_ready = False
-            self.last_credit = time.monotonic()
+            self.paused = False
+            self.audio_epoch = None
+            self.awaiting_video = self.destination == "youtubeVideo"
 
-    def write(self, data, check, offset=None):
+    def write(self, data, check, video_offset=None, audio_rate=0, prefix=b""):
         view = memoryview(data)
         sent = 0
         while sent < len(view):
             check()
-            end = min(len(view), sent + self.mtu)
-            if offset is not None:
+            capacity = self.mtu - len(prefix)
+            end = min(len(view), sent + (min(capacity, 336) if audio_rate else capacity))
+            if video_offset is not None:
                 with self.condition:
-                    while self.paused or self.credit <= offset + sent:
+                    deadline = time.monotonic() + 20
+                    while self.paused or self.credit <= video_offset + sent:
                         check()
-                        if not self.paused and time.monotonic() - self.last_credit > 20:
-                            raise TimeoutError("The Nano stopped reporting buffer space. Check its app version and reconnect.")
+                        if self.paused:
+                            deadline = time.monotonic() + 20
+                        elif time.monotonic() >= deadline:
+                            raise TimeoutError("The Nano stopped reporting video buffer space. Reconnect to retry.")
                         self.condition.wait(.1)
-                    end = min(end, self.credit - offset)
-            packet = view[sent:end]
+                    end = min(end, self.credit - video_offset)
+            if audio_rate:
+                with self.condition:
+                    while True:
+                        check()
+                        if self.paused:
+                            self.condition.wait(.1)
+                            continue
+                        now = time.monotonic()
+                        if self.audio_epoch is None:
+                            self.audio_epoch = now
+                        duration = (end - sent) / audio_rate
+                        deadline = max(self.audio_epoch + duration, now - max(0, .02 - duration))
+                        if deadline <= now:
+                            self.audio_epoch = deadline
+                            break
+                        self.condition.wait(deadline - now)
+            packet = prefix + view[sent:end].tobytes() if prefix else view[sent:end]
             if self.channel.send(packet) != len(packet):
                 raise OSError("Incomplete Bluetooth packet.")
             sent = end
-
-    def finish_video(self, check):
-        with self.condition:
-            while not self.video_ready:
-                check()
-                self.condition.wait(.25)
 
 
 class Sender:
@@ -156,16 +195,19 @@ class Sender:
         self.job = None
         self.status = "Connect to the Nano."
         self.progress = None
-        self.options = {"audio": "low", "quality": "balanced", "fps": 5,
-                        "playback": "after", "convert": False}
+        self.options = {mode: options.copy() for mode, options in DEFAULTS.items()}
 
     def snapshot(self):
         with self.lock:
             session = self.session
+            status = self.status
+            if session and session.destination == "youtubeVideo" and not session.awaiting_video and status.startswith("Video sent."):
+                status = "Ready for another video."
             return {"connected": session.destination if session else None, "busy": self.job is not None,
-                    "status": self.status, "progress": self.progress,
-                    "reconnect": bool(session and session.finished),
-                    "artwork": bool(session and session.artwork)}
+                    "status": status, "progress": self.progress,
+                    "waitingForVideo": bool(session and session.awaiting_video),
+                    "audioRevision": session.audio_revision if session else 0,
+                    "videoRevision": session.video_revision if session else 0}
 
     def connect(self, address, destination, local_address):
         self.disconnect()
@@ -191,28 +233,32 @@ class Sender:
                 self.session = None
                 if self.job:
                     self.job.set()
-                if self.status.startswith(("Connected", "Sending", "Playing", "Preparing", "Searching")):
+                if session.error:
+                    self.status = session.error
+                elif self.status.startswith(("Connected", "Sending", "Playing", "Preparing", "Searching")):
                     self.status = "The Nano closed the connection."
 
     def require(self, destination):
         with self.lock:
             if not self.session or self.session.destination != destination or self.session.closed.is_set():
                 raise RuntimeError("Connect to the matching Nano app first.")
-            if self.session.finished:
-                raise RuntimeError("Reconnect to the Nano before sending another file.")
+            if self.session.awaiting_video:
+                raise RuntimeError("Close playback on the Nano before sending another video.")
             return self.session
 
     def launch(self, action, session=None, quiet=False, cleanup=None):
         with self.lock:
-            if self.job or (session and (session is not self.session or session.closed.is_set())):
+            if self.job or (session and (session is not self.session or session.closed.is_set() or session.awaiting_video)):
                 if quiet:
                     return False
                 raise RuntimeError("The sender is busy or disconnected.")
             cancelled = self.job = threading.Event()
             self.progress = None
-            options = self.options.copy()
+            options = self.options[session.destination].copy() if session else {}
 
         def check():
+            if session and session.error:
+                raise RuntimeError(session.error)
             if cancelled.is_set() or (session and session.closed.is_set()):
                 raise InterruptedError("Cancelled.")
 
@@ -223,16 +269,19 @@ class Sender:
             except Exception as error:
                 self.status = str(error)
             finally:
-                if cleanup:
-                    cleanup()
-                with self.lock:
-                    self.job = None
+                try:
+                    if cleanup:
+                        cleanup()
+                finally:
+                    with self.lock:
+                        self.job = None
 
         threading.Thread(target=run, daemon=True).start()
         return True
 
     def request(self, session, data):
-        text = data[4:].decode("utf-8", "replace").strip()
+        raw = data[4:15] if data[:4] == b"NYP1" else data[4:].split(b"\0", 1)[0]
+        text = raw.decode("utf-8", "replace").strip()
         if data[:4] == b"NYQ1":
             self.launch(lambda folder, opts, check: self.search(session, text, check), session, quiet=True)
         else:
@@ -244,13 +293,16 @@ class Sender:
                                   text.encode("ascii", "replace")[:55]), check)
 
     def search(self, session, query, check):
+        if not query:
+            self.send_status(session, "Invalid search text.", check)
+            return
         video = session.destination == "youtubeVideo"
         self.status = "Searching YouTube…" if video else "Searching YouTube Music…"
         self.send_status(session, self.status, check, True)
         try:
             results = media.search(query, video, check)
             session.results = {item["id"]: item for item in results}
-            with_art = bool(results and session.artwork)
+            with_art = session.artwork
             response = bytearray(media.record(b"NYL1", bytes((len(results), with_art))))
             for item in results:
                 key = item["id"].encode()
@@ -273,7 +325,7 @@ class Sender:
         except Exception:
             session.close()
             raise
-        self.status = "Choose a result on the Nano." if results else "No results found."
+        self.status = "Choose a video on the Nano." if video else "Choose a song on the Nano."
 
     def select(self, session, key, folder, opts, check):
         item = session.results.get(key)
@@ -284,120 +336,231 @@ class Sender:
         host = "www.youtube.com" if video else "music.youtube.com"
         self.send_youtube(session, f"https://{host}/watch?v={key}", folder, opts, check, item)
 
+    def preparation(self, session, check, message, stage=None):
+        next_update = 0.0
+
+        def heartbeat(force=False):
+            nonlocal next_update
+            check()
+            now = time.monotonic()
+            if force or now >= next_update:
+                next_update = now + 1
+                if stage and session.video_progress:
+                    percent = 255 if self.progress is None else min(100, self.progress)
+                    session.write(media.record(b"NVT1", bytes((stage, percent))), check)
+                else:
+                    self.send_status(session, message, check, accepted=True)
+        return heartbeat
+
     def send_youtube(self, session, url, folder, opts, check, item=None):
-        video = session.destination in VIDEO
-        self.status = "Downloading YouTube video…" if video else "Downloading YouTube audio…"
-        if session.destination in YOUTUBE:
-            self.send_status(session, self.status, check, True)
+        video = session.destination == "youtubeVideo"
+        streaming = opts["playback"] == "live" and opts["download"]
         try:
-            source = media.download(url, folder, video, check)
             if video:
-                self.send_video(session, source, folder, opts, check)
+                self.send_video(session, None, folder, opts, check, url)
+            elif streaming:
+                self.send_progressive_audio(session, url, folder, opts, check)
             else:
-                cover = media.artwork(item, 160, False) if item else None
+                self.status = "Downloading YouTube audio…"
+                preparing = self.preparation(session, check, self.status)
+                preparing()
+                source = media.download(url, folder, False, preparing)
+                cover = media.cover_pixels(folder)
+                if cover is None and item:
+                    cover = media.artwork(item, 160, False)
                 self.send_audio(session, source, folder, opts, check, cover=cover)
         except Exception as error:
-            if session.destination in YOUTUBE and not session.closed.is_set():
+            if not session.closed.is_set():
                 self.send_status(session, str(error), check)
             raise
 
     def send_audio(self, session, source, folder, opts, check, name=None, cover=None):
         self.status = "Preparing audio…"
-        mulaw = session.destination == "youtubeAudio"
-        live = mulaw or (session.destination == "stream" and opts["playback"] == "live")
+        live = opts["playback"] == "live"
         rate, channels = media.AUDIO[opts["audio"]]
+        if live:
+            revision = 4 if rate == 44100 else 3
+            session.wait_for(lambda: session.audio_revision >= revision, check,
+                             "Update YT Music on the Nano to use While Sending.")
+        adpcm = session.audio_revision >= 5 or (live and rate == 44100 and session.audio_revision >= 4)
         wav = folder / "audio.wav"
-        size = media.audio_file(source, wav, opts["audio"], mulaw, check)
+        size = media.audio_file(source, wav, opts["audio"], adpcm, check)
         value = 2166136261
         with wav.open("rb") as file:
             for chunk in iter(lambda: file.read(65536), b""):
                 check()
                 value = media.checksum(chunk, value)
-        token = secrets.randbelow(media.UINT32_MAX) + 1 if mulaw else 0
+        token = secrets.randbelow(media.UINT32_MAX) + 1 if live else 0
         session.begin_flow(token)
-        header = media.audio_header(size, value, name or source.name,
-                                    ".nsa" if session.destination == "stream" and not live else ".wav",
-                                    token, bool(cover))
+        suffix = {"live": ".wav", "after": ".nsa", "test": ".ntx"}[opts["playback"]]
+        header = media.audio_header(size, value, name or source.name, suffix, token, bool(cover))
+        speed = audio_speed(rate, channels, adpcm) if live else 40 * 1024
+        sent = 0
         self.status = "Sending audio…"
         try:
             session.write(header, check)
             if cover:
                 session.write(cover, check)
-            sent = 0
-            started = time.monotonic()
             with wav.open("rb") as file:
                 for chunk in iter(lambda: file.read(8192), b""):
-                    if live and not mulaw:
-                        wait_until = started + (sent + len(chunk)) / (rate * channels * 2) - 3
-                        while time.monotonic() < wait_until:
-                            check()
-                            time.sleep(.025)
-                    session.write(chunk, check, sent if mulaw else None)
+                    session.write(chunk, check, audio_rate=speed)
                     sent += len(chunk)
                     self.progress = sent * 100 // size
         except Exception:
             session.close()
             raise
-        session.finished = not mulaw
-        self.status = "Audio sent."
+        self.status = {
+            "live": "Audio sent. Leave YT Music open to finish playback.",
+            "after": "Audio sent. The Nano will verify it before playing.",
+            "test": "Audio sent. Check the Nano for the receive test result.",
+        }[opts["playback"]]
 
-    def send_video(self, session, source, folder, opts, check):
-        live = opts["playback"] == "live"
-        self.status = "Preparing H.264 video…"
-        estimated = media.video_frame_estimate(source, opts["fps"], check)
-        video = media.video_records(source, folder, opts["quality"], opts["fps"], opts["audio"], live, check)
-        spool = folder / "video.groups"
+    def send_progressive_audio(self, session, url, folder, opts, check):
+        session.wait_for(lambda: session.audio_revision >= 6, check,
+                         "Update YT Music on the Nano to use Download during transfer.")
+        rate, channels = media.AUDIO[opts["audio"]]
+        token = secrets.randbelow(media.UINT32_MAX) + 1
+        speed = audio_speed(rate, channels, True)
+        self.status = "Opening YouTube audio stream…"
+        preparing = self.preparation(session, check, "Preparing YouTube audio…")
+        started = False
+        sent, checksum = 0, 2166136261
 
-        def advance(frames, packet):
-            if packet[:4] not in (b"NVL2", b"NVD2"):
-                length, count = struct.unpack_from("<II", packet)
-                if length:
-                    frames += count
-            if estimated:
-                self.progress = min(99, frames * 100 // estimated)
-            return frames
+        def check_preparation():
+            if started:
+                check()
+            else:
+                preparing()
 
-        if not opts["convert"]:
-            frames = 0
-            with closing(video), spool.open("wb") as file:
-                for packet in video:
-                    file.write(media.words(len(packet)))
-                    file.write(packet)
-                    frames = advance(frames, packet)
-            video = read_spool(spool)
-
-        def send():
-            session.begin_flow()
-            session.write(media.record(b"NCL3"), check)
-            sent = frames = 0
-            total = spool.stat().st_size if not opts["convert"] else None
-            self.progress = 0 if total or estimated else None
-            with closing(video):
-                for packet in video:
-                    if sent + len(packet) > media.UINT32_MAX:
-                        raise ValueError("The video exceeds the Nano's 4 GiB transfer range.")
-                    session.write(packet, check, sent)
-                    sent += len(packet)
-                    if total:
-                        self.progress = min(99, sent * 100 // total)
-                    else:
-                        frames = advance(frames, packet)
-
-        self.status = "Converting and sending H.264…" if opts["convert"] else "Sending H.264…"
         try:
-            send()
+            with media.download_stream(url, folder, False, check_preparation) as (pipe, validate):
+                blocks = media.audio_blocks(pipe, folder / "audio.wav", opts["audio"], check_preparation)
+                with closing(blocks):
+                    for chunk in blocks:
+                        if not started:
+                            started = True
+                            session.begin_flow(token)
+                            session.write(media.record(b"NYU1", media.words(rate, channels, token)), check)
+                            self.status = "Downloading, converting, and sending audio…"
+                        if sent + len(chunk) > media.UINT32_MAX:
+                            raise ValueError("The audio exceeds the Nano's 4 GiB transfer range.")
+                        session.write(chunk, check, audio_rate=speed, prefix=b"\0")
+                        checksum = media.checksum(chunk, checksum)
+                        sent += len(chunk)
+                validate()
+                session.write(b"\1" + media.words(sent, checksum), check)
         except Exception:
-            video.close()
-            session.close()
+            if started:
+                session.close()
             raise
         self.progress = 100
-        if session.destination == "youtubeVideo":
-            self.status = "Video sent. Close playback on the Nano to send another."
-            session.finish_video(check)
-            self.status = "Ready for another video."
-        else:
-            session.finished = True
-            self.status = "Video sent."
+        self.status = "Audio sent. Leave YT Music open to finish playback."
+
+    def send_video(self, session, source, folder, opts, check, url=None):
+        live = opts["playback"] == "live"
+        quality, fps = opts["quality"], opts["fps"]
+        minimum = 2 if quality == "native" else 0 if quality == "double" else 3
+        if fps == 22:
+            minimum = max(4, minimum)
+        if minimum:
+            session.wait_for(lambda: session.video_revision >= minimum, check,
+                             "Update YT Video on the Nano or choose another video quality or frame rate.")
+        if quality == "native" and fps != 22 and session.video_revision < 6:
+            fps = 30
+        streamed = url is not None and live and opts["download"]
+        convert = opts["convert"] or streamed
+        started = False
+        if url and not streamed:
+            self.status = "Downloading YouTube video…"
+            downloading = self.preparation(session, check, self.status, 1)
+            downloading()
+            source = media.download(url, folder, True, downloading)
+
+        preparing = self.preparation(session, check, "Downloading YouTube video…" if streamed
+                                     else "Preparing H.264 video…", 1 if streamed else 2)
+        self.status = "Opening YouTube video stream…" if streamed else "Preparing H.264 video…"
+        preparing()
+        estimated = media.video_frame_estimate(source, fps, preparing) if source else None
+
+        def check_preparation():
+            if started:
+                check()
+            else:
+                preparing()
+
+        def records(stream=None, validate=None):
+            track = media.video_records(source, folder, quality, fps, opts["audio"], live,
+                                        check_preparation, adpcm=session.video_revision >= 5, stream=stream)
+            with closing(track):
+                for packet in track:
+                    # The downloader must succeed before the receiver sees the end record.
+                    if validate and len(packet) == 12 and packet[:4] == b"\0" * 4:
+                        validate()
+                    yield packet
+
+        def send(packets, size=0, spool_size=None):
+            nonlocal started
+            sent = frames = 0
+            for packet in packets:
+                if not started:
+                    self.preparation(session, check, "Starting video transfer…", 3)()
+                    session.begin_flow()
+                    started = True
+                    session.write(media.record(b"NCL3", media.words(size, estimated or 0)), check)
+                    self.status = ("Downloading, converting, and sending H.264…" if streamed else
+                                   "Converting and sending H.264…" if convert else "Sending H.264…")
+                if sent + len(packet) > media.UINT32_MAX:
+                    raise ValueError("The video exceeds the Nano's 4 GiB transfer range.")
+                session.write(packet, check, video_offset=sent)
+                sent += len(packet)
+                frames += video_group_frames(packet)
+                if spool_size:
+                    self.progress = min(99, sent * 100 // spool_size)
+                elif estimated:
+                    self.progress = min(99, frames * 100 // estimated)
+
+        try:
+            if streamed:
+                with media.download_stream(url, folder, True, check_preparation) as (pipe, validate):
+                    with closing(records(pipe, validate)) as packets:
+                        send(packets)
+            elif convert:
+                with closing(records()) as packets:
+                    send(packets)
+            else:
+                spool = folder / "video.groups"
+                size = frames = 0
+                with closing(records()) as packets, spool.open("wb") as file:
+                    for packet in packets:
+                        size += len(packet)
+                        if size > media.UINT32_MAX:
+                            raise ValueError("The video exceeds the Nano's 4 GiB transfer range.")
+                        file.write(media.words(len(packet)))
+                        file.write(packet)
+                        frames += video_group_frames(packet)
+                        if estimated:
+                            self.progress = min(99, frames * 100 // estimated)
+                self.progress = 0
+                with closing(read_spool(spool)) as packets:
+                    send(packets, size, size)
+        except Exception:
+            if started:
+                session.close()
+            raise
+        check()
+        self.progress = 100
+        self.status = "Video sent. Leave YT Video open to finish playback."
+
+
+def audio_speed(rate, channels, adpcm):
+    samples = media.samples_per_block(channels)
+    encoded = (rate * media.IMA_BLOCK + samples - 1) // samples if adpcm else rate * channels
+    cap = (48 if encoded > 40 * 1024 else 40) * 1024
+    return min(cap, encoded * 1.05)
+
+
+def video_group_frames(packet):
+    return struct.unpack_from("<I", packet, 4)[0] if len(packet) > 12 and packet[:3] not in (b"NVL", b"NVD") else 0
 
 
 def read_spool(path):
