@@ -53,6 +53,7 @@ class App:
         self.radio = None
         self.radio_error = None
         self.device_list = []
+        self.last_radio_state = {}
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         if adapter is not None:
             self.call(self.start_radio(adapter))
@@ -209,9 +210,14 @@ class App:
             self.sender.options[destination] = options
 
     def state(self):
-        radio = self.call(self.radio_state(), 5)
-        return {**self.sender.snapshot(), **radio, "saved": self.saved,
-                "autoConnect": self.auto_enabled, "bondToRepair": self.bond_to_repair}
+        try:
+            self.last_radio_state = self.call(self.radio_state(), 1.5)
+        except TimeoutError:
+            # Report media progress even if the Bluetooth loop is slow.
+            pass
+        return {**self.sender.snapshot(), **self.last_radio_state, "saved": self.saved,
+                "autoConnect": self.auto_enabled, "bondToRepair": self.bond_to_repair,
+                "videoDownloadFirst": media.YOUTUBE_VIDEO_NO_JS}
 
     def command(self, action, payload):
         destination = payload.get("destination")

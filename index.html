@@ -36,7 +36,7 @@ input[type=checkbox] { accent-color: #174fc3; }
 .hint { color: #495976; font-size: 14px; line-height: 1.4; margin: 10px 0 0; }
 .status { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 #status { margin: 0; overflow-wrap: anywhere; }
-#error, #poll-error { color: #9b2531; }
+#error, #job-error, #poll-error { color: #9b2531; }
 progress { width: 100%; height: 8px; accent-color: #174fc3; margin-top: 12px; }
 dialog { border: 1px solid #cdd7e7; border-radius: 14px; padding: 24px; max-width: min(380px,90vw); }
 dialog::backdrop { background: #17263a88; }
@@ -102,6 +102,7 @@ dialog::backdrop { background: #17263a88; }
 <div class="status"><p id="status" role="status">Starting Nano Bluetooth Link…</p><button id="cancel" hidden>Cancel</button></div>
 <progress id="progress" max="100" hidden></progress>
 <p id="error" class="hint" role="alert" hidden></p>
+<p id="job-error" class="hint" role="alert" hidden></p>
 <p id="poll-error" class="hint" role="status" hidden></p>
 </section>
 </main>
@@ -176,7 +177,9 @@ function render() {
   for (const id of ['search-form', 'search-hint', 'link-form', 'playback-row', 'download-row']) hide(id, ble);
   for (const id of ['quality-row', 'fps-row', 'convert-row']) hide(id, !video);
   for (const id of ['transport-row', 'autoplay-row']) hide(id, !ble);
-  get('download').disabled = !live || busy;
+  const downloadFirst = video && state.videoDownloadFirst;
+  get('download').checked = Boolean(options.download && !downloadFirst);
+  get('download').disabled = !live || busy || Boolean(downloadFirst);
   get('convert').disabled = !initialized || busy;
   get('audio').disabled = !initialized || busy;
   get('quality').disabled = !initialized || busy;
@@ -234,6 +237,8 @@ function render() {
   } else if (video && connected && options.quality !== 'double' &&
     state.videoRevision < (options.quality === 'native' ? 2 : 3)) {
     hint = 'Update YT Video on the Nano to use this preset.';
+  } else if (downloadFirst) {
+    hint = 'YouTube videos download in full before sending.';
   } else if (!ble && live && options.download) {
     hint = !video && connected && state.audioRevision < 6 ? 'Update YT Music on the Nano to use Download during transfer.' :
       'YouTube links and search results convert as they download.';
@@ -241,6 +246,8 @@ function render() {
   set('media-hint', hint);
   hide('media-hint', !hint);
   set('status', state.scanning ? 'Searching for nearby Classic devices…' : state.status || 'Starting Bluetooth…');
+  set('job-error', state.jobError || '');
+  hide('job-error', !state.jobError);
   hide('progress', state.progress == null && !state.busy);
   if (state.progress == null) get('progress').removeAttribute('value');
   else get('progress').value = state.progress;
@@ -272,9 +279,14 @@ async function poll() {
       hide('poll-error', false);
       return;
     }
-    const next = await response.json();
-    if (!response.ok) throw Error(next.error);
-    state = next;
+    if (!response.ok) {
+      const failure = await response.json().catch(() => ({}));
+      set('poll-error', 'Pi status error (HTTP ' + response.status + '). ' +
+        (failure?.error || 'Waiting for the next update.'));
+      hide('poll-error', false);
+      return;
+    }
+    state = await response.json();
     hide('poll-error', true);
     if (!initialized) {
       if (!get('address').value) get('address').value = state.saved || '';

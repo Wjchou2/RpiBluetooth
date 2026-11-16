@@ -31,6 +31,25 @@ Both apps default to **While Sending**, **Download during transfer**, and **44.1
 
 You can also send a local file or a YouTube link from the webpage. **After Transfer** saves the encoded media before playback. YT Music also offers **Receive Test**. Close playback on the Nano before sending another video.
 
+### Download YouTube videos before sending
+
+If YouTube's JavaScript challenge repeatedly stalls or destabilizes the Pi, set
+`NANO_YOUTUBE_VIDEO_NO_JS=1` for the server. YT Video searches and downloads
+then run without a JavaScript runtime, and the server downloads the full
+source video before sending it to the Nano. While Sending still starts playback
+during the Bluetooth transfer. Some YouTube videos may have fewer formats in
+this mode.
+
+For a systemd service, run `sudo systemctl edit nano-sender` and add:
+
+```ini
+[Service]
+Environment=NANO_YOUTUBE_VIDEO_NO_JS=1
+```
+
+Then run `sudo systemctl restart nano-sender`. Remove that environment setting
+and restart the service to re-enable Download during transfer for YouTube videos.
+
 ## BLE
 
 Open the **BLE** tab in the browser and connect to **Nano Bluetooth Link** from **BLE Chat** or **Bluetooth Test**. Send and receive text. In Bluetooth Test, you can also send audio clips up to 30 seconds through **GATT Read**, **Notifications**, or **Fast Notifications**. The Pi uses the link's reported notification size when available and falls back to 20 bytes.

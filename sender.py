@@ -222,6 +222,7 @@ class Sender:
         self.lock = threading.RLock()
         self.session = None
         self.job = None
+        self.job_error = None
         self.status = "Connect to the Nano."
         self.progress = None
         self.options = {mode: options.copy() for mode, options in DEFAULTS.items()}
@@ -234,7 +235,7 @@ class Sender:
             if session and session.destination == "youtubeVideo" and not session.awaiting_video and status.startswith("Video sent."):
                 status = "Ready for another video."
             return {"connected": session.destination if session else None, "busy": self.job is not None,
-                    "status": status, "progress": self.progress,
+                    "status": status, "progress": self.progress, "jobError": self.job_error,
                     "waitingForVideo": bool(session and session.awaiting_video),
                     "audioRevision": session.audio_revision if session else 0,
                     "videoRevision": session.video_revision if session else 0,
@@ -294,6 +295,7 @@ class Sender:
                     return False
                 raise RuntimeError("The sender is busy or disconnected.")
             cancelled = self.job = threading.Event()
+            self.job_error = None
             self.progress = None
             options = self.options[session.destination].copy() if session else {}
 
@@ -308,9 +310,12 @@ class Sender:
                 with tempfile.TemporaryDirectory(prefix="nano-sender-") as folder:
                     action(Path(folder), options, check)
             except Exception as error:
-                self.status = str(error)
-                if not isinstance(error, InterruptedError):
-                    logging.warning("Nano media job failed: %s", error)
+                if isinstance(error, InterruptedError):
+                    self.status = "Cancelled."
+                else:
+                    self.job_error = str(error) or type(error).__name__
+                    self.status = "Media job failed."
+                    logging.warning("Nano media job failed: %s", self.job_error)
             finally:
                 try:
                     if cleanup:
@@ -521,7 +526,7 @@ class Sender:
                              "Update YT Video on the Nano or choose another video quality or frame rate.")
         if quality == "native" and fps != 22 and session.video_revision < 6:
             fps = 30
-        streamed = url is not None and live and opts["download"]
+        streamed = url is not None and live and opts["download"] and not media.YOUTUBE_VIDEO_NO_JS
         convert = opts["convert"] or streamed
         started = False
         if url and not streamed:

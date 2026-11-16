@@ -34,6 +34,15 @@ YT_DLP = ["yt-dlp", "--ignore-config", "--no-progress", "--no-warnings",
           "--js-runtimes", "node", "--socket-timeout", "15", "--extractor-retries", "1"]
 
 
+YOUTUBE_VIDEO_NO_JS = os.environ.get("NANO_YOUTUBE_VIDEO_NO_JS") == "1"
+
+
+def yt_dlp_args(video):
+    if video and YOUTUBE_VIDEO_NO_JS:
+        return [*YT_DLP, "--no-js-runtimes"]
+    return YT_DLP
+
+
 class YouTubeFormatUnavailable(RuntimeError):
     pass
 
@@ -147,7 +156,8 @@ def download_stream(url, folder, video, check):
     formats = ("b[height<=480][protocol^=m3u8]/b[height<=480][ext=webm]/b[height<=480][ext=mp4]/b"
                if video else "ba[ext=webm]/ba/b")
     sort = ["-S", "res:480"] if video else []
-    args = [*YT_DLP, "--no-playlist", "--hls-use-mpegts", *sort, "-f", formats, "-o", "-", "--", youtube_url(url)]
+    args = [*yt_dlp_args(video), "--no-playlist", "--hls-use-mpegts", *sort,
+            "-f", formats, "-o", "-", "--", youtube_url(url)]
     with (folder / "yt-dlp-stream.log").open("w+b") as log, subprocess.Popen(
             args, stdout=subprocess.PIPE, stderr=log, start_new_session=True) as child:
         def validate():
@@ -365,7 +375,7 @@ def download(url, folder, video, check):
         args = ["-f", formats, "-S", "res:480", "--merge-output-format", "mp4/mkv"]
     else:
         args = ["-f", "bestaudio[ext=m4a]/bestaudio", "-x", "--audio-format", "m4a", "--write-thumbnail"]
-    raw = process([*YT_DLP, "--no-playlist", *args, "--print", "after_move:filepath",
+    raw = process([*yt_dlp_args(video), "--no-playlist", *args, "--print", "after_move:filepath",
                    "-o", output, "--", youtube_url(url)], check, timeout=900)
     paths = raw.decode(errors="replace").splitlines()
     if paths:
@@ -382,7 +392,7 @@ def search(query, video, check):
     ]
 
     def entries(target):
-        raw = process([*YT_DLP, "--flat-playlist", "--playlist-items", "1:8", "--dump-json", "--", target],
+        raw = process([*yt_dlp_args(video), "--flat-playlist", "--playlist-items", "1:8", "--dump-json", "--", target],
                       check, timeout=45)
         rows = {}
         for line in raw.splitlines():
