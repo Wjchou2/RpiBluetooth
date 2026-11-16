@@ -31,20 +31,21 @@ Both apps default to **While Sending**, **Download during transfer**, and **44.1
 
 You can also send a local file or a YouTube link from the webpage. **After Transfer** saves the encoded media before playback. YT Music also offers **Receive Test**. Close playback on the Nano before sending another video.
 
-### YouTube Video without JavaScript
+### YouTube without JavaScript
 
 If YouTube's JavaScript challenge repeatedly stalls or destabilizes the Pi, set
-`NANO_YOUTUBE_VIDEO_NO_JS=1` for the server. YT Video searches and downloads
-then run without a JavaScript runtime. **While Sending** and **Download during
-transfer** can still be used together. If a combined stream is unavailable or
+`NANO_YOUTUBE_NO_JS=1` for the server. YT Music and YT Video then search and
+download without a JavaScript runtime. Set `NANO_YOUTUBE_VIDEO_NO_JS=1` to
+apply this to YT Video only. Both modes support **While Sending** with
+**Download during transfer**. If a combined video stream is unavailable or
 takes too long to start, the server downloads the full video before sending.
-Some YouTube videos may have fewer formats with JavaScript disabled.
+Some YouTube formats may be unavailable with JavaScript disabled.
 
 For a systemd service, run `sudo systemctl edit nano-sender` and add:
 
 ```ini
 [Service]
-Environment=NANO_YOUTUBE_VIDEO_NO_JS=1
+Environment=NANO_YOUTUBE_NO_JS=1
 ```
 
 Then run `sudo systemctl restart nano-sender`.

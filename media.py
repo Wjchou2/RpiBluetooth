@@ -34,11 +34,12 @@ YT_DLP = ["yt-dlp", "--ignore-config", "--no-progress", "--no-warnings",
           "--js-runtimes", "node", "--socket-timeout", "15", "--extractor-retries", "1"]
 
 
+YOUTUBE_NO_JS = os.environ.get("NANO_YOUTUBE_NO_JS") == "1"
 YOUTUBE_VIDEO_NO_JS = os.environ.get("NANO_YOUTUBE_VIDEO_NO_JS") == "1"
 
 
 def yt_dlp_args(video):
-    if video and YOUTUBE_VIDEO_NO_JS:
+    if YOUTUBE_NO_JS or (video and YOUTUBE_VIDEO_NO_JS):
         return [*YT_DLP, "--no-js-runtimes"]
     return YT_DLP
 
