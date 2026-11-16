@@ -2,6 +2,7 @@
 import concurrent.futures
 from contextlib import closing
 import errno
+import logging
 import re
 import secrets
 import socket
@@ -308,6 +309,8 @@ class Sender:
                     action(Path(folder), options, check)
             except Exception as error:
                 self.status = str(error)
+                if not isinstance(error, InterruptedError):
+                    logging.warning("Nano media job failed: %s", error)
             finally:
                 try:
                     if cleanup:
@@ -604,6 +607,7 @@ class Sender:
             if started:
                 session.close()
             elif streamed and isinstance(error, (media.YouTubeFormatUnavailable, VideoStreamStartupTimeout)):
+                logging.warning("YouTube video streaming startup failed: %s. Trying a full download.", error)
                 file_options = {**opts, "download": False, "convert": True}
                 return self.send_video(session, None, folder, file_options, check, url, fallback=True)
             raise

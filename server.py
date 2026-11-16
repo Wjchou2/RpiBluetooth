@@ -14,6 +14,8 @@ import threading
 import time
 from urllib.parse import parse_qs, urlsplit
 
+from dbus_next import DBusError
+
 import media
 from sender import ADDRESS, DEFAULTS, DESTINATIONS, PairingKeyMissing, Sender
 
@@ -50,6 +52,7 @@ class App:
         self.connection_lock = threading.Lock()
         self.radio = None
         self.radio_error = None
+        self.device_list = []
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         if adapter is not None:
             self.call(self.start_radio(adapter))
@@ -159,13 +162,20 @@ class App:
     async def radio_state(self):
         if self.radio is None:
             return {}
+        try:
+            devices = await asyncio.wait_for(self.radio.devices(), timeout=1)
+        except (DBusError, TimeoutError):
+            # A slow device lookup should not hide transfer status or pairing prompts.
+            pass
+        else:
+            self.device_list = [{key: device[key] for key in ("address", "name", "paired")}
+                                for device in devices]
         return {
             "pi": self.radio.address, "pairCode": self.radio.prompt, "radioError": self.radio_error,
             "scanning": self.radio.scan_stop is not None, "pairing": self.radio.pair_task is not None,
             "bleReady": self.radio.tx.notifying, "bleReadReady": bool(self.radio.audio_read.read_at),
             "receivedMessage": self.radio.received_message, "bleLimit": self.radio.notification_limit,
-            "devices": [{key: device[key] for key in ("address", "name", "paired")}
-                        for device in await self.radio.devices()],
+            "devices": self.device_list,
         }
 
     def remember(self, peer):
@@ -199,7 +209,8 @@ class App:
             self.sender.options[destination] = options
 
     def state(self):
-        return {**self.sender.snapshot(), **self.call(self.radio_state(), 5), "saved": self.saved,
+        radio = self.call(self.radio_state(), 5)
+        return {**self.sender.snapshot(), **radio, "saved": self.saved,
                 "autoConnect": self.auto_enabled, "bondToRepair": self.bond_to_repair}
 
     def command(self, action, payload):

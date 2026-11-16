@@ -36,7 +36,7 @@ input[type=checkbox] { accent-color: #174fc3; }
 .hint { color: #495976; font-size: 14px; line-height: 1.4; margin: 10px 0 0; }
 .status { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 #status { margin: 0; overflow-wrap: anywhere; }
-#error { color: #9b2531; }
+#error, #poll-error { color: #9b2531; }
 progress { width: 100%; height: 8px; accent-color: #174fc3; margin-top: 12px; }
 dialog { border: 1px solid #cdd7e7; border-radius: 14px; padding: 24px; max-width: min(380px,90vw); }
 dialog::backdrop { background: #17263a88; }
@@ -102,6 +102,7 @@ dialog::backdrop { background: #17263a88; }
 <div class="status"><p id="status" role="status">Starting Nano Bluetooth Link…</p><button id="cancel" hidden>Cancel</button></div>
 <progress id="progress" max="100" hidden></progress>
 <p id="error" class="hint" role="alert" hidden></p>
+<p id="poll-error" class="hint" role="status" hidden></p>
 </section>
 </main>
 <dialog id="pair-dialog">
@@ -265,10 +266,16 @@ async function poll() {
   if (polling) return;
   polling = true;
   try {
-    const response = await fetch('/state', {cache: 'no-store'});
+    const response = await fetch('/state', {cache: 'no-store', signal: AbortSignal.timeout(8000)});
+    if (response.status === 401) {
+      set('poll-error', 'The Pi requires a login. Reload the page and sign in again.');
+      hide('poll-error', false);
+      return;
+    }
     const next = await response.json();
     if (!response.ok) throw Error(next.error);
     state = next;
+    hide('poll-error', true);
     if (!initialized) {
       if (!get('address').value) get('address').value = state.saved || '';
       for (const mode of ['youtubeAudio', 'youtubeVideo']) {
@@ -280,8 +287,10 @@ async function poll() {
       await control('mode');
     }
     render();
-  } catch (error) { showError(error.message); }
-  finally { polling = false; }
+  } catch {
+    set('poll-error', 'Cannot refresh the Pi’s status. The transfer may still be running. Retrying…');
+    hide('poll-error', false);
+  } finally { polling = false; }
 }
 get('tabs').addEventListener('click', async event => {
   const next = event.target.dataset.tab;
