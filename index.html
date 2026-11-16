@@ -177,9 +177,7 @@ function render() {
   for (const id of ['search-form', 'search-hint', 'link-form', 'playback-row', 'download-row']) hide(id, ble);
   for (const id of ['quality-row', 'fps-row', 'convert-row']) hide(id, !video);
   for (const id of ['transport-row', 'autoplay-row']) hide(id, !ble);
-  const downloadFirst = video && state.videoDownloadFirst;
-  get('download').checked = Boolean(options.download && !downloadFirst);
-  get('download').disabled = !live || busy || Boolean(downloadFirst);
+  get('download').disabled = !live || busy;
   get('convert').disabled = !initialized || busy;
   get('audio').disabled = !initialized || busy;
   get('quality').disabled = !initialized || busy;
@@ -237,8 +235,6 @@ function render() {
   } else if (video && connected && options.quality !== 'double' &&
     state.videoRevision < (options.quality === 'native' ? 2 : 3)) {
     hint = 'Update YT Video on the Nano to use this preset.';
-  } else if (downloadFirst) {
-    hint = 'YouTube videos download in full before sending.';
   } else if (!ble && live && options.download) {
     hint = !video && connected && state.audioRevision < 6 ? 'Update YT Music on the Nano to use Download during transfer.' :
       'YouTube links and search results convert as they download.';

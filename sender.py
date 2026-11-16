@@ -526,7 +526,7 @@ class Sender:
                              "Update YT Video on the Nano or choose another video quality or frame rate.")
         if quality == "native" and fps != 22 and session.video_revision < 6:
             fps = 30
-        streamed = url is not None and live and opts["download"] and not media.YOUTUBE_VIDEO_NO_JS
+        streamed = url is not None and live and opts["download"]
         convert = opts["convert"] or streamed
         started = False
         if url and not streamed:
@@ -553,8 +553,8 @@ class Sender:
                 if startup_deadline is not None and time.monotonic() >= startup_deadline:
                     raise VideoStreamStartupTimeout("No playable video arrived from YouTube in time.")
 
-        def records(stream=None, validate=None):
-            track = media.video_records(source, folder, quality, fps, opts["audio"], live,
+        def records(encoding_folder, stream=None, validate=None):
+            track = media.video_records(source, encoding_folder, quality, fps, opts["audio"], live,
                                         check_preparation, adpcm=session.video_revision >= 5, stream=stream)
             with closing(track):
                 for packet in track:
@@ -586,16 +586,18 @@ class Sender:
 
         try:
             if streamed:
-                with media.download_stream(url, folder, True, check_preparation) as (pipe, validate):
-                    with closing(records(pipe, validate)) as packets:
+                stream_folder = folder / "stream"
+                stream_folder.mkdir()
+                with media.download_stream(url, stream_folder, True, check_preparation) as (pipe, validate):
+                    with closing(records(stream_folder, pipe, validate)) as packets:
                         send(packets)
             elif convert:
-                with closing(records()) as packets:
+                with closing(records(folder)) as packets:
                     send(packets)
             else:
                 spool = folder / "video.groups"
                 size = frames = 0
-                with closing(records()) as packets, spool.open("wb") as file:
+                with closing(records(folder)) as packets, spool.open("wb") as file:
                     for packet in packets:
                         size += len(packet)
                         if size > media.UINT32_MAX:

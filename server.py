@@ -216,8 +216,7 @@ class App:
             # Report media progress even if the Bluetooth loop is slow.
             pass
         return {**self.sender.snapshot(), **self.last_radio_state, "saved": self.saved,
-                "autoConnect": self.auto_enabled, "bondToRepair": self.bond_to_repair,
-                "videoDownloadFirst": media.YOUTUBE_VIDEO_NO_JS}
+                "autoConnect": self.auto_enabled, "bondToRepair": self.bond_to_repair}
 
     def command(self, action, payload):
         destination = payload.get("destination")
