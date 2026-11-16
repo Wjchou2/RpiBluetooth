@@ -22,6 +22,7 @@ DEFAULTS = {
 }
 ADDRESS = re.compile(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")
 VIDEO_STREAM_START_TIMEOUT = 45
+BLUETOOTH_SEND_TIMEOUT = 5
 
 
 class VideoStreamStartupTimeout(TimeoutError):
@@ -212,7 +213,16 @@ class Session:
                             break
                         self.condition.wait(deadline - now)
             packet = prefix + view[sent:end].tobytes() if prefix else view[sent:end]
-            if self.channel.send(packet) != len(packet):
+            send_deadline = time.monotonic() + BLUETOOTH_SEND_TIMEOUT
+            while True:
+                try:
+                    size = self.channel.send(packet)
+                    break
+                except socket.timeout as error:
+                    check()
+                    if time.monotonic() >= send_deadline:
+                        raise TimeoutError("Timed out sending to the Nano over Bluetooth.") from error
+            if size != len(packet):
                 raise OSError("Incomplete Bluetooth packet.")
             sent = end
 
@@ -313,9 +323,10 @@ class Sender:
                 if isinstance(error, InterruptedError):
                     self.status = "Cancelled."
                 else:
+                    phase = self.status
                     self.job_error = str(error) or type(error).__name__
                     self.status = "Media job failed."
-                    logging.warning("Nano media job failed: %s", self.job_error)
+                    logging.warning("Nano media job failed: %s (status: %s)", self.job_error, phase)
             finally:
                 try:
                     if cleanup:
@@ -419,7 +430,11 @@ class Sender:
                 self.send_audio(session, source, folder, opts, check, cover=cover)
         except Exception as error:
             if not session.closed.is_set():
-                self.send_status(session, str(error), check)
+                try:
+                    self.send_status(session, str(error), check)
+                except OSError:
+                    # A second Bluetooth failure must not hide the media error.
+                    pass
             raise
 
     def send_audio(self, session, source, folder, opts, check, name=None, cover=None):
