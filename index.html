@@ -201,6 +201,9 @@ function render() {
   hide('disconnect', !connected || pairing);
   hide('stop-pair', !state.pairing);
   get('scan').disabled = busy || Boolean(state.connected) || pairing;
+  const peer = get('address').value.trim().toUpperCase().replaceAll('-', ':');
+  const repairing = peer && peer === state.bondToRepair;
+  set('pair', repairing ? 'Pair again' : 'Pair');
   get('pair').disabled = busy || Boolean(state.connected) || pairing || !get('address').value.trim();
   get('connect').disabled = !initialized || busy || scanActive || !get('address').value.trim();
   get('message').disabled = busy;
@@ -212,7 +215,8 @@ function render() {
   get('search').disabled = busy || !ready || !get('query').value.trim();
   hide('cancel', !state.busy);
   const app = video ? 'YT Video' : 'YT Music';
-  set('discovery-hint', state.radioError || (state.pi ? 'On the Nano use Find Mac, or enter ' + state.pi + ' under Mac Address.' : 'Starting Bluetooth…'));
+  set('discovery-hint', repairing ? 'Forget the Pi in the Nano’s Bluetooth settings and keep that screen open while pairing.' :
+    state.radioError || (state.pi ? 'On the Nano use Find Mac, or enter ' + state.pi + ' under Mac Address.' : 'Starting Bluetooth…'));
   set('hint', state.waitingForVideo && connected ? 'Close playback on the Nano before sending another video.' :
     state.autoConnect && state.saved ? 'Open ' + app + ' on the Nano and start listening. The Pi connects automatically.' :
     'Open ' + app + ' on the Nano and start listening. Choose the Nano under Device Setup.');

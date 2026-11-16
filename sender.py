@@ -1,6 +1,7 @@
 """Classic L2CAP sessions and media transfer jobs."""
 import concurrent.futures
 from contextlib import closing
+import errno
 import re
 import secrets
 import socket
@@ -19,6 +20,17 @@ DEFAULTS = {
                      "quality": "large", "fps": 22, "convert": True},
 }
 ADDRESS = re.compile(r"(?:[0-9A-F]{2}:){5}[0-9A-F]{2}")
+VIDEO_STREAM_START_TIMEOUT = 45
+
+
+class VideoStreamStartupTimeout(TimeoutError):
+    pass
+
+
+class PairingKeyMissing(RuntimeError):
+    def __init__(self):
+        super().__init__("Bluetooth pairing key is missing. Forget the Pi on the Nano, then use "
+                         "Device Setup → Pair again in the browser.")
 
 
 def connect_socket(address, psm, local_address, timeout=12):
@@ -32,7 +44,13 @@ def connect_socket(address, psm, local_address, timeout=12):
         # Linux BT_SECURITY, medium: authenticate with the paired Nano.
         channel.setsockopt(getattr(socket, "SOL_BLUETOOTH", 274),
                            getattr(socket, "BT_SECURITY", 4), bytes((2, 0)))
-        channel.connect((address, psm))
+        try:
+            channel.connect((address, psm))
+        except OSError as error:
+            # Linux maps Bluetooth PIN or Key Missing (HCI 0x06) to EBADE.
+            if error.errno == getattr(errno, "EBADE", 52):
+                raise PairingKeyMissing() from error
+            raise
         # Linux L2CAP_OPTIONS starts with outgoing and incoming MTUs.
         mtu = struct.unpack_from("=H", channel.getsockopt(getattr(socket, "SOL_L2CAP", 6), 1, 12))[0]
         channel.settimeout(1)
@@ -489,7 +507,7 @@ class Sender:
         self.progress = 100
         self.status = "Audio sent. Leave YT Music open to finish playback."
 
-    def send_video(self, session, source, folder, opts, check, url=None):
+    def send_video(self, session, source, folder, opts, check, url=None, *, fallback=False):
         live = opts["playback"] == "live"
         quality, fps = opts["quality"], opts["fps"]
         minimum = 2 if quality == "native" else 0 if quality == "double" else 3
@@ -504,7 +522,8 @@ class Sender:
         convert = opts["convert"] or streamed
         started = False
         if url and not streamed:
-            self.status = "Downloading YouTube video…"
+            self.status = ("Stream unavailable. Downloading the full video…" if fallback
+                           else "Downloading the full YouTube video…")
             downloading = self.preparation(session, check, self.status, 1)
             downloading()
             source = media.download(url, folder, True, downloading)
@@ -514,12 +533,17 @@ class Sender:
         self.status = "Opening YouTube video stream…" if streamed else "Preparing H.264 video…"
         preparing()
         estimated = media.video_frame_estimate(source, fps, preparing) if source else None
+        startup_deadline = time.monotonic() + VIDEO_STREAM_START_TIMEOUT if streamed else None
 
         def check_preparation():
             if started:
                 check()
             else:
                 preparing()
+                # The downloader can keep its pipe open even when FFmpeg cannot
+                # produce a playable group from it.
+                if startup_deadline is not None and time.monotonic() >= startup_deadline:
+                    raise VideoStreamStartupTimeout("No playable video arrived from YouTube in time.")
 
         def records(stream=None, validate=None):
             track = media.video_records(source, folder, quality, fps, opts["audio"], live,
@@ -579,9 +603,9 @@ class Sender:
         except Exception as error:
             if started:
                 session.close()
-            elif streamed and isinstance(error, media.YouTubeFormatUnavailable):
+            elif streamed and isinstance(error, (media.YouTubeFormatUnavailable, VideoStreamStartupTimeout)):
                 file_options = {**opts, "download": False, "convert": True}
-                return self.send_video(session, None, folder, file_options, check, url)
+                return self.send_video(session, None, folder, file_options, check, url, fallback=True)
             raise
         check()
         self.progress = 100

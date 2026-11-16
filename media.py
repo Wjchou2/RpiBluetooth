@@ -302,11 +302,12 @@ def video_records(source, folder, quality, fps, audio, live, check, *, adpcm=Fal
                 avcc, samples = annex_b(segment.read_bytes())
                 if len(samples) > groups or (active and len(samples) != groups):
                     raise ValueError("FFmpeg returned an unsupported H.264 group.")
+                stream_header = None
                 if config is None:
                     config = avcc
                     tag = b"NVL" if live else b"NVD"
                     flags = channels | (0x80000000 if adpcm else 0)
-                    yield tag + (b"2" if groups == GROUP else b"3") + words(len(config), fps, rate, flags) + config
+                    stream_header = tag + (b"2" if groups == GROUP else b"3") + words(len(config), fps, rate, flags) + config
                 elif config != avcc:
                     raise ValueError("H.264 configuration changed mid-clip.")
                 start = (frames * rate // fps) * width_bytes
@@ -329,7 +330,12 @@ def video_records(source, folder, quality, fps, audio, live, check, *, adpcm=Fal
                 else:
                     sound = sound.ljust(stop - start, b"\xff")
                 body = b"".join(words(len(sample)) + sample for sample in samples) + sound
-                yield words(len(body), len(samples), checksum(body)) + body
+                # The caller commits the Nano transfer as soon as it sees the
+                # stream header. Wait until the first full group is available.
+                group = words(len(body), len(samples), checksum(body)) + body
+                if stream_header is not None:
+                    yield stream_header
+                yield group
                 segment.unlink()
                 index += 1
             if not frames:

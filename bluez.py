@@ -285,14 +285,18 @@ class Radio:
         if self.pair_task:
             self.pair_task.cancel()
 
-    async def pair(self, address):
+    async def pair(self, address, *, replace_bond=False):
         if self.pair_task:
             raise RuntimeError("Pairing is already in progress.")
         path = self.path + "/dev_" + address.replace(":", "_")
         self.pair_task = asyncio.current_task()
         self.pairing_device = path
         try:
-            if not any(device["path"] == path for device in await self.devices()):
+            existing = next((device for device in await self.devices() if device["path"] == path), None)
+            if replace_bond and existing and existing["paired"]:
+                await self.adapter.call_remove_device(path)
+                existing = None
+            if existing is None:
                 await self.scan(path)
             try:
                 device = await self.interface(path, "org.bluez.Device1")

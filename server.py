@@ -15,7 +15,7 @@ import time
 from urllib.parse import parse_qs, urlsplit
 
 import media
-from sender import ADDRESS, DEFAULTS, DESTINATIONS, Sender
+from sender import ADDRESS, DEFAULTS, DESTINATIONS, PairingKeyMissing, Sender
 
 PAGE = Path(__file__).with_name("index.html")
 MAX_UPLOAD = media.UINT32_MAX
@@ -38,6 +38,7 @@ class App:
         self.auto_wake = threading.Event()
         self.auto_stop = threading.Event()
         self.auto_after = 0
+        self.bond_to_repair = None
         self.auto_thread = None
         self.sender = Sender(connection_closed=self.auto_wake.set)
         self.loop = asyncio.new_event_loop()
@@ -88,7 +89,7 @@ class App:
             delay = None
             peer = self.saved
             with self.sender.lock:
-                if not peer or self.sender.session:
+                if not peer or self.sender.session or peer == self.bond_to_repair:
                     continue
                 if self.sender.job:
                     delay = 2
@@ -105,7 +106,7 @@ class App:
                 delay = max(0, self.auto_after - time.monotonic())
                 if delay:
                     continue
-                if peer != self.saved:
+                if peer != self.saved or peer == self.bond_to_repair:
                     continue
                 with self.sender.lock:
                     if self.sender.session or self.sender.job:
@@ -122,6 +123,11 @@ class App:
                         if self.sender.connect(peer, destination, self.radio.address, automatic=True):
                             delay, retry = None, AUTO_RETRY_MIN
                             destinations = [destination] + [other for other in destinations if other != destination]
+                        break
+                    except PairingKeyMissing as error:
+                        self.bond_to_repair = peer
+                        self.sender.status = str(error)
+                        delay = None
                         break
                     except OSError as error:
                         if isinstance(error, TimeoutError) or error.errno in ADAPTER_UNREACHABLE:
@@ -194,7 +200,7 @@ class App:
 
     def state(self):
         return {**self.sender.snapshot(), **self.call(self.radio_state(), 5), "saved": self.saved,
-                "autoConnect": self.auto_enabled}
+                "autoConnect": self.auto_enabled, "bondToRepair": self.bond_to_repair}
 
     def command(self, action, payload):
         destination = payload.get("destination")
@@ -218,14 +224,23 @@ class App:
                 if action == "connect":
                     self.options(payload)
                     self.sender.status = "Pairing or connecting to the Nano…"
-                self.call(self.radio.pair(peer), timeout=90)
+                repair = action == "pair" and peer == self.bond_to_repair
+                self.call(self.radio.pair(peer, replace_bond=repair), timeout=90)
+                if repair:
+                    self.bond_to_repair = None
                 self.remember(peer)
                 if action == "connect":
                     self.sender.connect(peer, destination, self.radio.address)
+                    if peer == self.bond_to_repair:
+                        self.bond_to_repair = None
                 else:
                     self.sender.status = ("Paired. Open YT Music or YT Video on the Nano to connect."
                                           if self.auto_enabled else
                                           "Paired. Open the matching app on the Nano and click Connect.")
+            except PairingKeyMissing as error:
+                self.bond_to_repair = peer
+                self.sender.status = str(error)
+                raise
             except Exception as error:
                 self.sender.status = str(error)
                 raise
